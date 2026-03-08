@@ -5,7 +5,40 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from enum import Enum
 from typing import Optional
+import os
 
+# ═══════════════════════════════════════════════════════════════
+# ОТЛАДКА — ДОБАВЬ ЭТО В НАЧАЛО
+# ═══════════════════════════════════════════════════════════════
+
+print("═" * 60)
+print("ОТЛАДКА ЗАГРУЗКИ КОНФИГУРАЦИИ")
+print("═" * 60)
+print(f"Текущая директория: {os.getcwd()}")
+print(f"Файлы .env в директории:")
+for f in ['.env', '.env.local', '.env.production']:
+    exists = os.path.exists(f)
+    print(f"  {f}: {'✓ найден' if exists else '✗ не найден'}")
+
+    # Если файл существует — покажем первые строки
+    if exists:
+        try:
+            with open(f, 'r', encoding='utf-8') as file:
+                lines = file.readlines()[:3]  # Первые 3 строки
+                for line in lines:
+                    # Скрываем значения (показываем только ключи)
+                    if '=' in line and not line.strip().startswith('#'):
+                        key = line.split('=')[0]
+                        print(f"    → {key}=***")
+        except Exception as e:
+            print(f"    Ошибка чтения файла: {e}")
+
+encryption_key_from_env = os.getenv('ENCRYPTION_KEY', 'НЕ УСТАНОВЛЕН')
+if encryption_key_from_env != 'НЕ УСТАНОВЛЕН':
+    print(f"ENCRYPTION_KEY из os.getenv: {encryption_key_from_env[:10]}...")
+else:
+    print(f"ENCRYPTION_KEY из os.getenv: НЕ УСТАНОВЛЕН")
+print("═" * 60)
 
 # ═══════════════════════════════════════════════════════════════
 # Enum для окружений
@@ -24,35 +57,17 @@ class WBEnvironment(str, Enum):
 class Config(BaseSettings):
     """
     Конфигурация приложения.
-
-    Переменные загружаются в порядке приоритета:
-    1. Системные переменные окружения (export VAR=value)
-    2. ..env.local (локальные секреты)
-    3. .env (шаблон с примерами)
-    4. Значения по умолчанию (ниже)
     """
-
-    # ───────────────────────────────────────────────────────────
-    # DATABASE
-    # ───────────────────────────────────────────────────────────
 
     DATABASE_URL: str = Field(
         default="postgresql://postgres:password@localhost:5432/wb_analytics",
         description="Строка подключения к PostgreSQL"
     )
 
-    # ───────────────────────────────────────────────────────────
-    # WILDBERRIES API
-    # ───────────────────────────────────────────────────────────
-
     WB_ENV: WBEnvironment = Field(
         default=WBEnvironment.SANDBOX,
         description="Окружение WB API: sandbox или production"
     )
-
-    # ───────────────────────────────────────────────────────────
-    # SCHEDULER
-    # ───────────────────────────────────────────────────────────
 
     SYNC_INTERVAL_MINUTES: int = Field(
         default=1440,
@@ -67,10 +82,6 @@ class Config(BaseSettings):
         description="Глубина выгрузки данных (месяцы)"
     )
 
-    # ───────────────────────────────────────────────────────────
-    # API LIMITS
-    # ───────────────────────────────────────────────────────────
-
     WB_API_MAX_DAYS_PER_REQUEST: int = Field(
         default=31,
         ge=1,
@@ -83,10 +94,6 @@ class Config(BaseSettings):
         ge=1,
         description="Пауза между запросами при 429 (секунды)"
     )
-
-    # ───────────────────────────────────────────────────────────
-    # МНОГОПОТОЧНОСТЬ
-    # ───────────────────────────────────────────────────────────
 
     MAX_TOTAL_WORKERS: int = Field(
         default=15,
@@ -114,21 +121,16 @@ class Config(BaseSettings):
         description="Параллельная синхронизация задач пользователя"
     )
 
-    ENCRYPTION_KEY: str = Field(
+    # ← ВАЖНО: Сделай поле необязательным с дефолтом для отладки
+    ENCRYPTION_KEY: Optional[str] = Field(
+        default=None,
         description="Ключ шифрования для токенов (Fernet)"
     )
-    # ───────────────────────────────────────────────────────────
-    # LOGGING
-    # ───────────────────────────────────────────────────────────
 
     LOG_LEVEL: str = Field(
         default="INFO",
         description="Уровень логирования: DEBUG, INFO, WARNING, ERROR"
     )
-
-    # ───────────────────────────────────────────────────────────
-    # COMPUTED PROPERTIES (вычисляемые на основе WB_ENV)
-    # ───────────────────────────────────────────────────────────
 
     @property
     def WB_API_REPORT_URL(self) -> str:
@@ -149,10 +151,6 @@ class Config(BaseSettings):
         """URL для API рекламы"""
         return "https://advert-api.wildberries.ru"
 
-    # ───────────────────────────────────────────────────────────
-    # VALIDATORS (валидация значений)
-    # ───────────────────────────────────────────────────────────
-
     @field_validator('LOG_LEVEL')
     @classmethod
     def validate_log_level(cls, v: str) -> str:
@@ -171,12 +169,8 @@ class Config(BaseSettings):
             return WBEnvironment(v.lower())
         return v
 
-    # ───────────────────────────────────────────────────────────
-    # SETTINGS CONFIG
-    # ───────────────────────────────────────────────────────────
-
     model_config = SettingsConfigDict(
-        env_file=('.env', '.env.production','.env.local'),
+        env_file=('.env', '.env.production', '.env.local'),
         env_file_encoding='utf-8',
         case_sensitive=True,
         extra='ignore'
@@ -188,6 +182,14 @@ class Config(BaseSettings):
 # ═══════════════════════════════════════════════════════════════
 
 config = Config()
+
+# ← ДОБАВЬ ОТЛАДКУ ПОСЛЕ СОЗДАНИЯ
+print("ПОСЛЕ СОЗДАНИЯ CONFIG:")
+if config.ENCRYPTION_KEY:
+    print(f"✅ config.ENCRYPTION_KEY загружен: {config.ENCRYPTION_KEY[:20]}...")
+else:
+    print("❌ config.ENCRYPTION_KEY = None (НЕ ЗАГРУЖЕН)")
+print("═" * 60)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -203,46 +205,35 @@ def print_config() -> None:
     print("\n🌐 WILDBERRIES API:")
     print(f"  Окружение: {config.WB_ENV.value}")
     print(f"  Reports URL: {config.WB_API_REPORT_URL}")
-    print(f"  Funnel URL: {config.WB_API_FUNNEL_PRODUCT_URL}")
-    print(f"  Advert URL: {config.WB_API_ADVERT_URL}")
 
     print("\n🗄️  DATABASE:")
-    # Скрываем пароль
     db_url_safe = config.DATABASE_URL.split('@')[-1] if '@' in config.DATABASE_URL else config.DATABASE_URL
     print(f"  URL: ...@{db_url_safe}")
 
     print("\n⏱️  SCHEDULER:")
     print(f"  Интервал синхронизации: {config.SYNC_INTERVAL_MINUTES} мин")
-    print(f"  Глубина данных: {config.DATA_RETENTION_MONTHS} мес")
-
-    print("\n🔧 API LIMITS:")
-    print(f"  Максимум дней/запрос: {config.WB_API_MAX_DAYS_PER_REQUEST}")
-    print(f"  Задержка при 429: {config.WB_API_RETRY_DELAY} сек")
 
     print("\n⚡ МНОГОПОТОЧНОСТЬ:")
     print(f"  Всего потоков: {config.MAX_TOTAL_WORKERS}")
-    print(f"  На тип задачи: {config.MAX_WORKERS_PER_TASK_TYPE}")
-    print(f"  На пользователя: {config.MAX_WORKERS_PER_USER}")
-    print(f"  Параллельные задачи: {config.PARALLEL_USER_TASKS}")
-    print(f"  ENCRYPTION_KEY: {config.ENCRYPTION_KEY}")
+
+    print("\n🔐 ШИФРОВАНИЕ:")
+    if config.ENCRYPTION_KEY:
+        print(f"  ENCRYPTION_KEY: {config.ENCRYPTION_KEY[:20]}...")
+    else:
+        print(f"  ENCRYPTION_KEY: ❌ НЕ УСТАНОВЛЕН")
+
     print("\n📋 LOGGING:")
     print(f"  Уровень: {config.LOG_LEVEL}")
-
     print("=" * 60)
 
 
 def validate_config() -> bool:
-    """
-    Проверяет корректность конфигурации.
-    Возвращает True если всё ОК.
-    """
+    """Проверяет корректность конфигурации"""
     try:
-        # Проверка DATABASE_URL
         if not config.DATABASE_URL.startswith('postgresql://'):
             print("❌ DATABASE_URL должен начинаться с 'postgresql://'")
             return False
 
-        # Проверка логических ограничений
         if config.MAX_WORKERS_PER_TASK_TYPE > config.MAX_TOTAL_WORKERS:
             print("❌ MAX_WORKERS_PER_TASK_TYPE не может быть больше MAX_TOTAL_WORKERS")
             return False
@@ -258,10 +249,6 @@ def validate_config() -> bool:
         print(f"❌ Ошибка валидации конфигурации: {e}")
         return False
 
-
-# ═══════════════════════════════════════════════════════════════
-# CLI для тестирования конфигурации
-# ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     print_config()

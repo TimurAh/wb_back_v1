@@ -27,7 +27,17 @@ from database import test_connection,init_database
 from scheduler import sync_all_users
 from api import router as api_router
 from utils import logger
+from crypto import set_encryption_key
 
+# ═══════════════════════════════════════════════════════════════
+# Инициализация ключа шифрования ← ДОБАВЛЕНО
+# ═══════════════════════════════════════════════════════════════
+
+if config.ENCRYPTION_KEY:
+    set_encryption_key(config.ENCRYPTION_KEY)
+    logger.info("✓ Ключ шифрования инициализирован")
+else:
+    logger.warning("⚠️ ENCRYPTION_KEY не установлен — шифрование токенов недоступно")
 
 # ═══════════════════════════════════════════════════════════════
 # Глобальный планировщик

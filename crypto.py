@@ -2,33 +2,29 @@
 Шифрование токенов для безопасного хранения
 """
 from cryptography.fernet import Fernet
-import os
-import base64
+from typing import Optional
 
 
-# ═══════════════════════════════════════════════════════════════
-# Генерация ключа шифрования
-# ═══════════════════════════════════════════════════════════════
+# Глобальная переменная для кеширования ключа
+_encryption_key: Optional[bytes] = None
 
-def generate_encryption_key() -> bytes:
+
+def set_encryption_key(key: str) -> None:
     """
-    Генерирует ключ шифрования.
+    Устанавливает ключ шифрования из конфигурации.
 
-    ВАЖНО: Вызови один раз, сохрани ключ в переменную окружения!
+    Вызывается один раз при старте приложения из config.
 
-    Returns:
-        bytes: Ключ шифрования в формате base64
+    Args:
+        key: Ключ шифрования в формате base64
     """
-    return Fernet.generate_key()
+    global _encryption_key
+    _encryption_key = key.encode()
 
-
-# ═══════════════════════════════════════════════════════════════
-# Получение ключа из переменной окружения
-# ═══════════════════════════════════════════════════════════════
 
 def get_encryption_key() -> bytes:
     """
-    Получает ключ шифрования из переменной окружения.
+    Получает ключ шифрования.
 
     Returns:
         bytes: Ключ шифрования
@@ -36,23 +32,14 @@ def get_encryption_key() -> bytes:
     Raises:
         ValueError: Если ключ не установлен
     """
-    key = os.getenv('ENCRYPTION_KEY')
-
-    if not key:
+    if _encryption_key is None:
         raise ValueError(
-            "ENCRYPTION_KEY не установлен в переменных окружения!\n"
-            "Сгенерируй ключ:\n"
-            "  python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'\n"
-            "И добавь в .env.local:\n"
-            "  ENCRYPTION_KEY=сгенерированный_ключ"
+            "ENCRYPTION_KEY не установлен!\n"
+            "Вызовите set_encryption_key(config.ENCRYPTION_KEY) при старте приложения."
         )
 
-    return key.encode()
+    return _encryption_key
 
-
-# ═══════════════════════════════════════════════════════════════
-# Шифрование и расшифровка
-# ═══════════════════════════════════════════════════════════════
 
 def encrypt_token(token: str) -> str:
     """
@@ -68,7 +55,7 @@ def encrypt_token(token: str) -> str:
     fernet = Fernet(key)
 
     encrypted = fernet.encrypt(token.encode())
-    return base64.urlsafe_b64encode(encrypted).decode()
+    return encrypted.decode()
 
 
 def decrypt_token(encrypted_token: str) -> str:
@@ -84,6 +71,8 @@ def decrypt_token(encrypted_token: str) -> str:
     key = get_encryption_key()
     fernet = Fernet(key)
 
-    decoded = base64.urlsafe_b64decode(encrypted_token.encode())
-    decrypted = fernet.decrypt(decoded)
+    decrypted = fernet.decrypt(encrypted_token.encode())
     return decrypted.decode()
+
+
+__all__ = ['encrypt_token', 'decrypt_token', 'set_encryption_key']
