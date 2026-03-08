@@ -1,4 +1,5 @@
 from .connection import get_connection, get_cursor, test_connection
+from .init_schema import init_database
 from .queries import (
     get_users_with_tokens,
     get_last_report_date,
@@ -41,6 +42,7 @@ __all__ = [
     "get_connection",
     "get_cursor",
     "test_connection",
+    "init_database",
     # Users & Reports
     "get_users_with_tokens",
     "get_last_report_date",

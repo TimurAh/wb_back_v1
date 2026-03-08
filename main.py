@@ -23,7 +23,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from config import config
-from database import test_connection
+from database import test_connection,init_database
 from scheduler import sync_all_users
 from api import router as api_router
 from utils import logger
@@ -62,7 +62,11 @@ async def lifespan(app: FastAPI):
     if not test_connection():
         logger.error("Не удалось подключиться к БД!")
         sys.exit(1)
-
+    # ← ДОБАВЛЕНО: Инициализация БД
+    logger.info("Инициализация структуры БД...")
+    if not init_database():
+        logger.error("Не удалось инициализировать БД!")
+        sys.exit(1)
     # Настройка планировщика
     scheduler.add_job(
         sync_all_users,
