@@ -114,6 +114,9 @@ class Config(BaseSettings):
         description="Параллельная синхронизация задач пользователя"
     )
 
+    ENCRYPTION_KEY: str = Field(
+        description="Ключ шифрования для токенов (Fernet)"
+    )
     # ───────────────────────────────────────────────────────────
     # LOGGING
     # ───────────────────────────────────────────────────────────
@@ -221,7 +224,7 @@ def print_config() -> None:
     print(f"  На тип задачи: {config.MAX_WORKERS_PER_TASK_TYPE}")
     print(f"  На пользователя: {config.MAX_WORKERS_PER_USER}")
     print(f"  Параллельные задачи: {config.PARALLEL_USER_TASKS}")
-
+    print(f"  ENCRYPTION_KEY: {config.ENCRYPTION_KEY}")
     print("\n📋 LOGGING:")
     print(f"  Уровень: {config.LOG_LEVEL}")
 

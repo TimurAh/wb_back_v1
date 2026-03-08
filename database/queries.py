@@ -13,6 +13,7 @@ from config import config
 from utils import logger
 from models.financial_report import FinancialReportRow, validate_wb_reports
 from models.costprices import CostPriceItem, CostPricesApiResponse
+from crypto import decrypt_token
 
 def get_users_with_tokens() -> List[Dict[str, Any]]:
     """
@@ -20,7 +21,7 @@ def get_users_with_tokens() -> List[Dict[str, Any]]:
     """
     query = """
         SELECT user_id, username, wb_token
-        FROM public."user"
+        FROM "user"
         WHERE wb_token IS NOT NULL
           AND wb_token != ''
     """
@@ -28,8 +29,26 @@ def get_users_with_tokens() -> List[Dict[str, Any]]:
     with get_cursor() as cursor:
         cursor.execute(query)
         users = cursor.fetchall()
-        logger.info(f"Найдено пользователей с токенами: {len(users)}")
-        return [dict(u) for u in users]
+
+        # Расшифровываем токены
+        decrypted_users = []
+        for user in users:
+            user_dict = dict(user)
+
+            try:
+                # Расшифровываем токен
+                user_dict['wb_token'] = decrypt_token(user_dict['wb_token'])
+                decrypted_users.append(user_dict)
+            except Exception as e:
+                # Если токен не удалось расшифровать — пропускаем пользователя
+                logger.error(
+                    f"Не удалось расшифровать токен для пользователя "
+                    f"{user_dict['user_id']} ({user_dict['username']}): {e}"
+                )
+                continue
+
+        logger.info(f"Найдено пользователей с валидными токенами: {len(decrypted_users)}")
+        return decrypted_users
 
 
 def get_last_report_date(user_id: int) -> Optional[date]:
@@ -41,7 +60,7 @@ def get_last_report_date(user_id: int) -> Optional[date]:
     """
     query = """
         SELECT MAX(date_to::date) as last_date
-        FROM public.financial_reports
+        FROM financial_reports
         WHERE user_id = %s
     """
 
@@ -68,14 +87,14 @@ def get_users_load_info() -> List[Dict[str, Any]]:
             COALESCE(stats.records_count, 0) as records_count,
             stats.first_record_date,
             stats.last_record_date
-        FROM public."user" u
+        FROM "user" u
         LEFT JOIN (
             SELECT 
                 user_id,
                 COUNT(*) as records_count,
                 MIN(date_from::date) as first_record_date,
                 MAX(date_to::date) as last_record_date
-            FROM public.financial_reports
+            FROM financial_reports
             GROUP BY user_id
         ) stats ON u.user_id = stats.user_id
         WHERE u.wb_token IS NOT NULL
@@ -217,9 +236,9 @@ def get_metrics_for_period_from_report(
                     ELSE 0 
                 END
             ), 0) as deduction
-        FROM public.financial_reports
-            left join public.cost_price on public.cost_price.nm_id = public.financial_reports.nm_id
-        WHERE public.financial_reports.user_id = %s
+        FROM financial_reports
+            left join cost_price on cost_price.nm_id = financial_reports.nm_id
+        WHERE financial_reports.user_id = %s
           AND date_to::date >= %s::date
           AND date_to::date <= %s::date
     """
@@ -344,9 +363,9 @@ def get_dynamic_for_period_from_report(
                                         END \
                             ), 0)                                  as deduction,
                 date_to as date
-            FROM public.financial_reports
-                     left join public.cost_price on public.cost_price.nm_id = public.financial_reports.nm_id
-            WHERE public.financial_reports.user_id = %s
+            FROM financial_reports
+                     left join cost_price on cost_price.nm_id = financial_reports.nm_id
+            WHERE financial_reports.user_id = %s
               AND date_to::date >= %s:: date
               AND date_to:: date <= %s:: date \
             GROUP BY date_to ORDER BY date_to asc
@@ -470,17 +489,17 @@ def get_detail_for_period_from_report(
                                         ELSE 0 \
                                         END \
                             ), 0)                                  as deduction,
-                public.financial_reports.nm_id as nm_id,
-                Max(public.cost_price.url_photo) as product_image_url,
-                Max(public.cost_price.sa_name) as sa_name
-            FROM public.financial_reports
-                     left join public.cost_price on public.cost_price.nm_id = public.financial_reports.nm_id
-            WHERE public.financial_reports.user_id = %s
+                financial_reports.nm_id as nm_id,
+                Max(cost_price.url_photo) as product_image_url,
+                Max(cost_price.sa_name) as sa_name
+            FROM financial_reports
+                     left join cost_price on cost_price.nm_id = financial_reports.nm_id
+            WHERE financial_reports.user_id = %s
               AND date_to::date >= %s:: date
               AND date_to:: date <= %s:: date \
 
-            GROUP BY public.financial_reports.nm_id 
-            ORDER BY public.financial_reports.nm_id asc
+            GROUP BY financial_reports.nm_id 
+            ORDER BY financial_reports.nm_id asc
             """
 
     with get_cursor() as cursor:
@@ -522,7 +541,7 @@ def get_dynamic_for_period_from_funnel(
                 ELSE 0 
             END AS conversions_cart_to_order_percent,
             AVG(NULLIF(fp.conversions_buyout_percent, 0)) AS conversions_buyout_percent
-        FROM public.funnel_product fp
+        FROM funnel_product fp
         WHERE fp.user_id = %(user_id)s
           AND fp.date_funnel >= %(date_from)s::date
           AND fp.date_funnel <= %(date_to)s::date
@@ -573,10 +592,10 @@ def get_detail_for_period_from_funnel(
             END AS conversions_cart_to_order_percent,
             AVG(NULLIF(fp.conversions_buyout_percent, 0)) AS conversions_buyout_percent,
             Max(fp.vendor_code) as vendor_code,
-            Max(public.cost_price.url_photo) as product_image_url,
-            Max(public.cost_price.sa_name) as sa_name
-        FROM public.funnel_product fp
-            left join public.cost_price on public.cost_price.nm_id = fp.nm_id
+            Max(cost_price.url_photo) as product_image_url,
+            Max(cost_price.sa_name) as sa_name
+        FROM funnel_product fp
+            left join cost_price on cost_price.nm_id = fp.nm_id
         WHERE fp.user_id = %(user_id)s
           AND fp.date_funnel >= %(date_from)s::date
           AND fp.date_funnel <= %(date_to)s::date
@@ -609,7 +628,7 @@ def get_metrics_for_period_from_advert_stats(
     query = """
         SELECT 
              SUM(sum) as ad_expense
-            FROM public.advert_fullstats
+            FROM advert_fullstats
             WHERE user_id = %(user_id)s
               AND date_stat >= %(date_from)s::date
               AND date_stat <= %(date_to)s::date
@@ -641,7 +660,7 @@ def get_dynamic_for_period_from_advert_stats(
         SELECT 
              SUM(sum) as ad_expense,
             date_stat as date
-            FROM public.advert_fullstats
+            FROM advert_fullstats
             WHERE user_id = %(user_id)s
               AND date_stat >= %(date_from)s::date
               AND date_stat <= %(date_to)s::date
@@ -676,7 +695,7 @@ def get_detail_for_period_from_advert_stats(
         SELECT 
              SUM(sum) as ad_expense,
             nm_id as nm_id
-            FROM public.advert_fullstats
+            FROM advert_fullstats
             WHERE user_id = %(user_id)s
               AND date_stat >= %(date_from)s::date
               AND date_stat <= %(date_to)s::date
@@ -718,7 +737,7 @@ def get_metrics_for_period_from_funnel(
                 SUM(cancel_sum)                            AS cancel_sum,
                 SUM(cancel_count)                          AS cancel_count,
                 AVG(NULLIF(conversions_buyout_percent, 0)) AS conversions_buyout_percent
-            FROM public.funnel_product
+            FROM funnel_product
             WHERE user_id = %(user_id)s
               AND date_funnel >= %(date_from)s::date
               AND date_funnel <= %(date_to)s::date
@@ -742,7 +761,7 @@ def get_metrics_for_period_from_funnel(
                 ELSE 0 
             END AS conversions_cart_to_order_percent,
             AVG(NULLIF(fp.conversions_buyout_percent, 0)) AS conversions_buyout_percent
-        FROM public.funnel_product fp
+        FROM funnel_product fp
             WHERE fp.user_id = %(user_id)s
               AND fp.date_funnel >= %(date_from)s::date
               AND fp.date_funnel <= %(date_to)s::date
@@ -806,7 +825,7 @@ def get_details_by_product(
                     ELSE 0 
                 END
             ), 0) as returns_count
-        FROM public.financial_reports
+        FROM financial_reports
         WHERE user_id = %s
           AND date_to::date >= %s::date
           AND date_to::date <= %s::date
@@ -950,7 +969,7 @@ def insert_financial_reports(user_id: int, reports: List[Dict[str, Any]]) -> int
     update_str = ", ".join([f"{f} = EXCLUDED.{f}" for f in update_fields])
 
     query = f"""
-        INSERT INTO public.financial_reports ({fields_str})
+        INSERT INTO financial_reports ({fields_str})
         VALUES %s
         ON CONFLICT (rrd_id) 
         DO UPDATE SET {update_str}
@@ -979,7 +998,7 @@ def cleanup_old_reports(months: int = None) -> int:
     cutoff_date = date.today() - timedelta(days=months * 30)
 
     query = """
-        DELETE FROM public.financial_reports
+        DELETE FROM financial_reports
         WHERE date_to::date < %s
     """
 
@@ -1008,7 +1027,7 @@ def get_last_funnel_date(user_id: int) -> Optional[date]:
     """
     query = """
         SELECT MAX(date_funnel) as last_date
-        FROM public.funnel_product
+        FROM funnel_product
         WHERE user_id = %s
     """
 
@@ -1102,7 +1121,7 @@ def insert_funnel_products(
     update_str = ", ".join([f"{f} = EXCLUDED.{f}" for f in update_fields])
 
     query = f"""
-        INSERT INTO public.funnel_product ({fields_str})
+        INSERT INTO funnel_product ({fields_str})
         VALUES %s
         ON CONFLICT (user_id, nm_id, date_funnel) 
         DO UPDATE SET {update_str}
@@ -1131,7 +1150,7 @@ def cleanup_old_funnel_data(months: int = None) -> int:
     cutoff_date = date.today() - timedelta(days=months * 30)
 
     query = """
-        DELETE FROM public.funnel_product
+        DELETE FROM funnel_product
         WHERE date_funnel < %s
     """
 
@@ -1158,7 +1177,7 @@ def get_funnel_stats_for_user(user_id: int) -> Dict[str, Any]:
             MIN(date_funnel) as first_date,
             MAX(date_funnel) as last_date,
             COUNT(DISTINCT date_funnel) as days_count
-        FROM public.funnel_product
+        FROM funnel_product
         WHERE user_id = %s
     """
 
@@ -1233,7 +1252,7 @@ def insert_advert_stats(
 
     # При конфликте обновляем sum и updated_at
     query = f"""
-        INSERT INTO public.advert_fullstats ({fields_str}, updated_at)
+        INSERT INTO advert_fullstats ({fields_str}, updated_at)
         VALUES %s
         ON CONFLICT (user_id, advert_id, date_stat, app_type, nm_id) 
         DO UPDATE SET 
@@ -1274,7 +1293,7 @@ def cleanup_old_advert_stats(months: int = None) -> int:
 
     query = """
             DELETE \
-            FROM public.advert_fullstats
+            FROM advert_fullstats
             WHERE date_stat < %s \
             """
 
@@ -1303,7 +1322,7 @@ def get_advert_stats_for_user(user_id: int) -> Dict[str, Any]:
                    MAX(date_stat)            as last_date, \
                    COUNT(DISTINCT date_stat) as days_count, \
                    COALESCE(SUM(sum), 0)     as total_sum
-            FROM public.advert_fullstats
+            FROM advert_fullstats
             WHERE user_id = %s \
             """
 
@@ -1341,14 +1360,14 @@ def get_advert_stats_for_user(user_id: int) -> Dict[str, Any]:
 
 def load_nm_from_financial_reports_in_cost_price(user_id: int) -> Dict[str, Any]:
     query = """
-            INSERT INTO public.cost_price (nm_id, user_id, sa_name, url_photo)
+            INSERT INTO cost_price (nm_id, user_id, sa_name, url_photo)
             SELECT DISTINCT \
             ON (nm_id)
                 nm_id,
                 user_id,
                 sa_name,
                 'https://img.icons8.com/?size=100&id=118959&format=png&color=000000'
-            FROM public.financial_reports
+            FROM financial_reports
             WHERE user_id = %s
               AND nm_id IS NOT NULL
               AND nm_id != 0
@@ -1384,7 +1403,7 @@ def update_photos_in_cost_price(user_id: int, photos: Dict[int, str]) -> int:
     values = [(url, nm_id, user_id) for nm_id, url in photos.items()]
 
     query = """
-        UPDATE public.cost_price
+        UPDATE cost_price
         SET url_photo = data.url_photo,
             updated_at = NOW()
         FROM (VALUES %s) AS data(url_photo, nm_id, user_id)
@@ -1427,7 +1446,7 @@ def get_cost_price(user_id: int) -> CostPricesApiResponse:
                    url_photo,
                    c_price,
                    fulfillment
-            FROM public.cost_price
+            FROM cost_price
             WHERE user_id = %s
             ORDER BY nm_id
             """
@@ -1469,12 +1488,12 @@ def insert_cost_price(user_id: int,nm_id: int, cost_price: float, fulfillment:fl
            fulfillment: Фулфилмент (может быть None)
        """
     query = """
-            INSERT INTO public.cost_price (nm_id, user_id, c_price, fulfillment)
+            INSERT INTO cost_price (nm_id, user_id, c_price, fulfillment)
             VALUES (%s, %s, %s, %s) ON CONFLICT (nm_id, user_id) 
             DO 
             UPDATE SET
-                c_price = COALESCE (EXCLUDED.c_price, public.cost_price.c_price), 
-                fulfillment = COALESCE (EXCLUDED.fulfillment, public.cost_price.fulfillment), 
+                c_price = COALESCE (EXCLUDED.c_price, cost_price.c_price), 
+                fulfillment = COALESCE (EXCLUDED.fulfillment, cost_price.fulfillment), 
                 updated_at = NOW() 
             """
 
