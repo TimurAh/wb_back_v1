@@ -137,6 +137,72 @@ class WBApiClient:
 
         return all_reports
 
+    def get_financial_reports_streaming(
+            self,
+            date_from: date,
+            date_to: date,
+            user_id: Optional[int] = None,
+            on_batch: callable = None
+    ) -> int:
+        """
+        Получает финансовые отчёты STREAMING — не накапливает в памяти.
+        Каждый интервал сразу передаётся в callback для обработки.
+
+        Args:
+            date_from: Начало периода
+            date_to: Конец периода
+            user_id: ID пользователя (для логов)
+            on_batch: Callback функция on_batch(reports: List[Dict])
+                      вызывается для каждого интервала
+
+        Returns:
+            Общее количество полученных записей
+        """
+        intervals = self._split_period(date_from, date_to)
+        log_prefix = f"User {user_id}: " if user_id else ""
+        total_count = 0
+
+        logger.debug(
+            f"{log_prefix}Запрос отчётов (streaming): {date_from} - {date_to}, "
+            f"интервалов: {len(intervals)}"
+        )
+
+        for interval_idx, (interval_start, interval_end) in enumerate(intervals):
+            reports = self._fetch_reports_for_interval(
+                interval_start,
+                interval_end,
+                user_id=user_id
+            )
+
+            if reports:
+                batch_count = len(reports)
+                total_count += batch_count
+
+                if batch_count > 95000:
+                    logger.warning(
+                        f"{log_prefix}Количество строк критическое: {batch_count}. "
+                        f"Период: {interval_start} - {interval_end}"
+                    )
+
+                logger.debug(
+                    f"{log_prefix}Интервал {interval_idx + 1}/{len(intervals)}: "
+                    f"получено {batch_count} записей"
+                )
+
+                # ⚡ Сразу обрабатываем через callback
+                if on_batch:
+                    on_batch(reports)
+
+                # ⚡ Освобождаем память
+                del reports
+
+            # Пауза между интервалами
+            if len(intervals) > 1 and interval_idx < len(intervals) - 1:
+                time.sleep(1)
+
+        logger.info(f"{log_prefix}Отчёты (streaming): всего {total_count} записей")
+        return total_count
+
     def _fetch_reports_for_interval(
         self,
         date_from: date,
@@ -505,6 +571,99 @@ class WBApiClient:
 
         return all_stats
 
+    def get_advert_fullstats_streaming(
+            self,
+            advert_ids: List[int],
+            date_from: date,
+            date_to: date,
+            user_id: Optional[int] = None,
+            on_batch: callable = None
+    ) -> int:
+        """
+        Получает статистику рекламы STREAMING — не накапливает в памяти.
+        Каждая пачка сразу передаётся в callback для обработки.
+
+        Args:
+            advert_ids: Список ID рекламных кампаний
+            date_from: Начало периода
+            date_to: Конец периода
+            user_id: ID пользователя (для логов)
+            on_batch: Callback функция on_batch(stats: List)
+                      вызывается для каждой пачки
+
+        Returns:
+            Общее количество полученных записей
+        """
+        if not advert_ids:
+            return 0
+
+        log_prefix = f"User {user_id}: " if user_id else ""
+        total_count = 0
+
+        # Разбиваем период на интервалы
+        intervals = self._split_period(date_from, date_to)
+
+        logger.debug(
+            f"{log_prefix}Период {date_from} - {date_to} разбит на "
+            f"{len(intervals)} интервалов"
+        )
+
+        # Разбиваем advert_ids на пачки по 50
+        batch_size = 50
+        batches = [
+            advert_ids[i:i + batch_size]
+            for i in range(0, len(advert_ids), batch_size)
+        ]
+
+        total_requests = len(intervals) * len(batches)
+
+        logger.info(
+            f"{log_prefix}Запрос fullstats (streaming): {len(advert_ids)} кампаний, "
+            f"{len(batches)} пачек × {len(intervals)} интервалов = "
+            f"{total_requests} запросов"
+        )
+
+        request_num = 0
+
+        for interval_idx, (interval_start, interval_end) in enumerate(intervals):
+            logger.debug(
+                f"{log_prefix}Интервал {interval_idx + 1}/{len(intervals)}: "
+                f"{interval_start} - {interval_end}"
+            )
+
+            for batch_idx, batch in enumerate(batches):
+                request_num += 1
+
+                batch_stats = self._fetch_fullstats_batch(
+                    advert_ids=batch,
+                    begin_date=interval_start,
+                    end_date=interval_end,
+                    user_id=user_id,
+                    batch_num=request_num,
+                    total_batches=total_requests
+                )
+
+                if batch_stats:
+                    batch_count = len(batch_stats)
+                    total_count += batch_count
+
+                    # ⚡ Сразу обрабатываем через callback
+                    if on_batch:
+                        on_batch(batch_stats)
+
+                    # ⚡ Освобождаем память
+                    del batch_stats
+
+                # Пауза между запросами
+                if request_num < total_requests:
+                    time.sleep(1)
+
+            # Дополнительная пауза между интервалами
+            if interval_idx < len(intervals) - 1:
+                time.sleep(0.5)
+
+        logger.info(f"{log_prefix}Advert stats (streaming): всего {total_count} записей")
+        return total_count
     def _fetch_fullstats_batch(
         self,
         advert_ids: List[int],

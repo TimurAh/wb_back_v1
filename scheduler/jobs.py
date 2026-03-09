@@ -96,7 +96,7 @@ def force_gc():
 def sync_user_reports(user_id: int, username: str, wb_token: str) -> TaskResult:
     """
     Синхронизирует финансовые отчёты для одного пользователя.
-    STREAMING: получаем данные порциями и сразу вставляем в БД.
+    STREAMING: каждый интервал сразу вставляется в БД.
     """
     start_time = time.time()
     thread_name = threading.current_thread().name
@@ -109,26 +109,34 @@ def sync_user_reports(user_id: int, username: str, wb_token: str) -> TaskResult:
     total_inserted = 0
 
     try:
-        # ✅ ИЗМЕНЕНИЕ: Используем контекстный менеджер
         with create_client(wb_token) as client:
-            # Получаем отчёты (API сам разбивает на интервалы)
-            reports = client.get_financial_reports(date_from, date_to, user_id=user_id)
 
-            if reports:
-                # Вставляем сразу, не храним в памяти
-                inserted = insert_financial_reports(user_id, reports)
-                total_inserted = inserted
+            # ⚡ STREAMING: callback для вставки каждого интервала
+            def on_reports_batch(reports):
+                nonlocal total_inserted
+                if reports:
+                    inserted = insert_financial_reports(user_id, reports)
+                    total_inserted += inserted
+                    logger.debug(
+                        f"[{thread_name}] User {user_id}: "
+                        f"вставлено {inserted} записей"
+                    )
+                    # Память освобождается в client.py после вызова callback
 
-                logger.info(
-                    f"[{thread_name}] User {user_id}: ← Отчёты синхронизированы: {inserted}"
-                )
-            else:
-                logger.info(f"[{thread_name}] User {user_id}: нет данных отчётов")
+            # Запускаем streaming загрузку
+            client.get_financial_reports_streaming(
+                date_from=date_from,
+                date_to=date_to,
+                user_id=user_id,
+                on_batch=on_reports_batch
+            )
 
-            # ⚡ ЯВНАЯ ОЧИСТКА ПАМЯТИ
-            del reports
+        # HTTP клиент закрыт
 
-        # HTTP клиент автоматически закрыт здесь
+        logger.info(
+            f"[{thread_name}] User {user_id}: ← Отчёты синхронизированы: {total_inserted}"
+        )
+
         force_gc()
 
         return TaskResult(
@@ -284,6 +292,7 @@ def sync_user_funnel(user_id: int, username: str, wb_token: str) -> TaskResult:
 def sync_user_advert_stats(user_id: int, username: str, wb_token: str) -> TaskResult:
     """
     Синхронизирует рекламную статистику для одного пользователя.
+    STREAMING: каждая пачка сразу вставляется в БД.
     """
     start_time = time.time()
     thread_name = threading.current_thread().name
@@ -293,14 +302,15 @@ def sync_user_advert_stats(user_id: int, username: str, wb_token: str) -> TaskRe
         f"[{thread_name}] User {user_id}: → Реклама за {date_from} - {date_to}"
     )
 
+    total_inserted = 0
+
     try:
-        # ✅ ИЗМЕНЕНИЕ: Используем контекстный менеджер
         with create_client(wb_token) as client:
+            # Получаем список рекламных кампаний
             advert_ids = client.get_promotion_advert_ids(user_id=user_id)
 
             if not advert_ids:
                 logger.info(f"[{thread_name}] User {user_id}: нет рекламных кампаний")
-                # HTTP клиент автоматически закроется
                 return TaskResult(
                     user_id=user_id,
                     username=username,
@@ -312,27 +322,35 @@ def sync_user_advert_stats(user_id: int, username: str, wb_token: str) -> TaskRe
                     duration_seconds=time.time() - start_time
                 )
 
-            stats = client.get_advert_fullstats(
+            # ⚡ STREAMING: callback для вставки каждой пачки
+            def on_stats_batch(stats):
+                nonlocal total_inserted
+                if stats:
+                    inserted = insert_advert_stats(user_id, stats)
+                    total_inserted += inserted
+                    logger.debug(
+                        f"[{thread_name}] User {user_id}: "
+                        f"вставлено {inserted} записей рекламы"
+                    )
+
+            # Запускаем streaming загрузку
+            client.get_advert_fullstats_streaming(
                 advert_ids=advert_ids,
                 date_from=date_from,
                 date_to=date_to,
-                user_id=user_id
+                user_id=user_id,
+                on_batch=on_stats_batch
             )
 
-            inserted = 0
-            if stats:
-                inserted = insert_advert_stats(user_id, stats)
-                logger.info(
-                    f"[{thread_name}] User {user_id}: ← Реклама синхронизирована: {inserted}"
-                )
-            else:
-                logger.info(f"[{thread_name}] User {user_id}: нет данных рекламы")
-
-            # ⚡ ЯВНАЯ ОЧИСТКА
-            del stats
+            # Освобождаем список ID
             del advert_ids
 
-        # HTTP клиент автоматически закрыт здесь
+        # HTTP клиент закрыт
+
+        logger.info(
+            f"[{thread_name}] User {user_id}: ← Реклама синхронизирована: {total_inserted}"
+        )
+
         force_gc()
 
         return TaskResult(
@@ -340,7 +358,7 @@ def sync_user_advert_stats(user_id: int, username: str, wb_token: str) -> TaskRe
             username=username,
             task_type=TaskType.ADVERT,
             success=True,
-            records_count=inserted,
+            records_count=total_inserted,
             no_access=False,
             error=None,
             duration_seconds=time.time() - start_time
