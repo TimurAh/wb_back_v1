@@ -14,6 +14,7 @@ from utils import logger
 from models.financial_report import FinancialReportRow, validate_wb_reports
 from models.costprices import CostPriceItem, CostPricesApiResponse
 from crypto import decrypt_token
+import json
 
 def get_users_with_tokens() -> List[Dict[str, Any]]:
     """
@@ -258,118 +259,103 @@ def get_dynamic_for_period_from_report(
         user_id: int,
         date_from: str,
         date_to: str
-) -> Dict[str, Any]:
+) -> List[Dict[str, Any]]:  # ← Изменить тип возврата
     """
     Рассчитывает данные для динамики за период из financial_reports.
-    revenue - продажи руб. Напрямую идут в карточки
-    sales_count - продажи шт. Напрямую идут в карточки
-    returns_sum - возврат руб. Напрямую идут в карточки ( нет подтверждения, что это сумма корректна с количеством)
-    returns_quantity - возврат шт.Напрямую идут в карточки
-    cancels_sum - отмены руб.Напрямую идут в карточки
-    cancels_quantity - отмены шт.Напрямую идут в карточки
-    ppvz_for_pay - Перечисление продавцу. Используется для расчета чистой прибыли.
-    commission  -                                                                  неправильный расчет. Потом переделать
-    logistics - логистика. Напрямую идут в карточки и для расчета логистику за ед.
-    penalties - Штрафы. Напрямую идут в карточки
-    storage - Хранение. Используется для расчета чистой прибыли.
-    acceptance - Платная приемка. Используется для расчета чистой прибыли.
-    sum_cost_price - сумма себестоимости. Используется для расчета чистой прибыли и ROI.
-    sum_for_contribution - сумма для налога. Используется для расчета чистой прибыли.
-    deduction - Удержание без рекламы. Используется для расчета чистой прибыли.
     """
     query = """
-            SELECT COALESCE(SUM( \
-                                    CASE \
-                                        WHEN doc_type_name = 'Продажа' \
-                                            THEN retail_price * COALESCE(quantity, 1) \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as revenue, \
-                   COALESCE(SUM( \
-                                    CASE \
-                                        WHEN doc_type_name = 'Возврат' \
-                                            THEN retail_price \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as returns_sum, \
-
-                   COALESCE(SUM( \
-                                    CASE \
-                                        WHEN bonus_type_name = 'От клиента при возврате' \
-                                            THEN COALESCE(return_amount, 1) \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as returns_quantity, \
-
-                   COALESCE(SUM( \
-                                    CASE \
-                                        WHEN bonus_type_name = 'От клиента при отмене' \
-                                            THEN ABS(retail_amount * COALESCE(return_amount, 1)) \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as cancels_sum, \
-                   COALESCE(SUM( \
-                                    CASE \
-                                        WHEN doc_type_name = 'Продажа' \
-                                            THEN retail_amount * COALESCE(quantity, 1) \
-                                        WHEN doc_type_name = 'Возврат' \
-                                            THEN -retail_amount * COALESCE(quantity, 1) \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as sum_for_contribution, \
-                   COALESCE(SUM( \
-                                    CASE \
-                                        WHEN bonus_type_name = 'От клиента при отмене' \
-                                            THEN COALESCE(return_amount, 1) \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as cancels_quantity, \
-                   COALESCE(SUM(CASE \
-                                    WHEN doc_type_name = 'Продажа' \
-                                        THEN ppvz_for_pay \
-                                    WHEN doc_type_name = 'Возврат' \
-                                        THEN -ppvz_for_pay \
-                                    ELSE 0 \
-                       END), 0)                                    as ppvz_for_pay, \
-                   COALESCE(AVG(NULLIF(commission_percent, 0)), 0) as commission, \
-                   COALESCE(SUM(delivery_rub), 0)                  as logistics, \
-                   COALESCE(SUM(penalty), 0)                       as penalties, \
-                   COALESCE(SUM(storage_fee), 0)                   as storage, \
-                   COALESCE(SUM(acceptance), 0)                    as acceptance, \
-                   COALESCE(SUM( \
-                                    CASE \
-                                        WHEN supplier_oper_name = 'Продажа' \
-                                            THEN COALESCE(quantity, 1) \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as sales_count, \
-                   COALESCE(SUM( \
-                                    CASE \
-                                        WHEN doc_type_name = 'Продажа' \
-                                            THEN COALESCE(quantity, 1) * \
-                                                 (COALESCE(c_price, 0) + COALESCE(fulfillment, 0)) \
-                                        WHEN doc_type_name = 'Возврат' \
-                                            THEN COALESCE(quantity, 1) * \
-                                                 (COALESCE(c_price, 0) + COALESCE(fulfillment, 0)) * -1 \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as sum_cost_price, \
-                   COALESCE(SUM( \
-                                    CASE \
-                                        WHEN supplier_oper_name = 'Удержание' and \
-                                             bonus_type_name NOT LIKE '%%WB Продвижение%%' \
-                                            THEN COALESCE(deduction, 0) \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as deduction,
-                date_to as date
-            FROM financial_reports
-                     left join cost_price on cost_price.nm_id = financial_reports.nm_id
-            WHERE financial_reports.user_id = %s
-              AND date_to::date >= %s:: date
-              AND date_to:: date <= %s:: date \
-            GROUP BY date_to ORDER BY date_to asc
-            """
+        SELECT 
+            COALESCE(SUM(
+                CASE 
+                    WHEN doc_type_name = 'Продажа' 
+                        THEN retail_price * COALESCE(quantity, 1) 
+                    ELSE 0 
+                END
+            ), 0) as revenue,
+            COALESCE(SUM(
+                CASE 
+                    WHEN doc_type_name = 'Возврат' 
+                        THEN retail_price 
+                    ELSE 0 
+                END
+            ), 0) as returns_sum,
+            COALESCE(SUM(
+                CASE 
+                    WHEN bonus_type_name = 'От клиента при возврате' 
+                        THEN COALESCE(return_amount, 1) 
+                    ELSE 0 
+                END
+            ), 0) as returns_quantity,
+            COALESCE(SUM(
+                CASE 
+                    WHEN bonus_type_name = 'От клиента при отмене' 
+                        THEN ABS(retail_amount * COALESCE(return_amount, 1)) 
+                    ELSE 0 
+                END
+            ), 0) as cancels_sum,
+            COALESCE(SUM(
+                CASE 
+                    WHEN doc_type_name = 'Продажа' 
+                        THEN retail_amount * COALESCE(quantity, 1) 
+                    WHEN doc_type_name = 'Возврат' 
+                        THEN -retail_amount * COALESCE(quantity, 1) 
+                    ELSE 0 
+                END
+            ), 0) as sum_for_contribution,
+            COALESCE(SUM(
+                CASE 
+                    WHEN bonus_type_name = 'От клиента при отмене' 
+                        THEN COALESCE(return_amount, 1) 
+                    ELSE 0 
+                END
+            ), 0) as cancels_quantity,
+            COALESCE(SUM(
+                CASE 
+                    WHEN doc_type_name = 'Продажа' 
+                        THEN ppvz_for_pay 
+                    WHEN doc_type_name = 'Возврат' 
+                        THEN -ppvz_for_pay 
+                    ELSE 0 
+                END
+            ), 0) as ppvz_for_pay,
+            COALESCE(AVG(NULLIF(commission_percent, 0)), 0) as commission,
+            COALESCE(SUM(delivery_rub), 0) as logistics,
+            COALESCE(SUM(penalty), 0) as penalties,
+            COALESCE(SUM(storage_fee), 0) as storage,
+            COALESCE(SUM(acceptance), 0) as acceptance,
+            COALESCE(SUM(
+                CASE 
+                    WHEN supplier_oper_name = 'Продажа' 
+                        THEN COALESCE(quantity, 1) 
+                    ELSE 0 
+                END
+            ), 0) as sales_count,
+            COALESCE(SUM(
+                CASE 
+                    WHEN doc_type_name = 'Продажа' 
+                        THEN COALESCE(quantity, 1) * (COALESCE(c_price, 0) + COALESCE(fulfillment, 0)) 
+                    WHEN doc_type_name = 'Возврат' 
+                        THEN COALESCE(quantity, 1) * (COALESCE(c_price, 0) + COALESCE(fulfillment, 0)) * -1 
+                    ELSE 0 
+                END
+            ), 0) as sum_cost_price,
+            COALESCE(SUM(
+                CASE 
+                    WHEN supplier_oper_name = 'Удержание' 
+                        AND bonus_type_name NOT LIKE '%%WB Продвижение%%' 
+                        THEN COALESCE(deduction, 0) 
+                    ELSE 0 
+                END
+            ), 0) as deduction,
+            date_to as date
+        FROM financial_reports
+        LEFT JOIN cost_price ON cost_price.nm_id = financial_reports.nm_id
+        WHERE financial_reports.user_id = %s
+          AND date_to::date >= %s::date
+          AND date_to::date <= %s::date
+        GROUP BY date_to 
+        ORDER BY date_to ASC
+    """
 
     with get_cursor() as cursor:
         cursor.execute(query, (user_id, date_from, date_to))
@@ -378,129 +364,111 @@ def get_dynamic_for_period_from_report(
         if result:
             return [dict(row) for row in result]
 
-        return {
-        }
+        return []
 
 def get_detail_for_period_from_report(
         user_id: int,
         date_from: str,
         date_to: str
-) -> Dict[str, Any]:
+) -> List[Dict[str, Any]]:  # ← Изменить тип возврата
     """
-    Рассчитывает данные для динамики за период из financial_reports.
-    revenue - продажи руб. Напрямую идут в карточки
-    sales_count - продажи шт. Напрямую идут в карточки
-    returns_sum - возврат руб. Напрямую идут в карточки ( нет подтверждения, что это сумма корректна с количеством)
-    returns_quantity - возврат шт.Напрямую идут в карточки
-    cancels_sum - отмены руб.Напрямую идут в карточки
-    cancels_quantity - отмены шт.Напрямую идут в карточки
-    ppvz_for_pay - Перечисление продавцу. Используется для расчета чистой прибыли.
-    commission  -                                                                  неправильный расчет. Потом переделать
-    logistics - логистика. Напрямую идут в карточки и для расчета логистику за ед.
-    penalties - Штрафы. Напрямую идут в карточки
-    storage - Хранение. Используется для расчета чистой прибыли.
-    acceptance - Платная приемка. Используется для расчета чистой прибыли.
-    sum_cost_price - сумма себестоимости. Используется для расчета чистой прибыли и ROI.
-    sum_for_contribution - сумма для налога. Используется для расчета чистой прибыли.
-    deduction - Удержание без рекламы. Используется для расчета чистой прибыли.
+    Рассчитывает данные детализации за период из financial_reports.
     """
     query = """
-            SELECT COALESCE(SUM( \
-                                    CASE \
-                                        WHEN doc_type_name = 'Продажа' \
-                                            THEN retail_price * COALESCE(quantity, 1) \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as revenue, \
-                   COALESCE(SUM( \
-                                    CASE \
-                                        WHEN doc_type_name = 'Возврат' \
-                                            THEN retail_price \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as returns_sum, \
-
-                   COALESCE(SUM( \
-                                    CASE \
-                                        WHEN bonus_type_name = 'От клиента при возврате' \
-                                            THEN COALESCE(return_amount, 1) \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as returns_quantity, \
-
-                   COALESCE(SUM( \
-                                    CASE \
-                                        WHEN bonus_type_name = 'От клиента при отмене' \
-                                            THEN ABS(retail_amount * COALESCE(return_amount, 1)) \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as cancels_sum, \
-                   COALESCE(SUM( \
-                                    CASE \
-                                        WHEN doc_type_name = 'Продажа' \
-                                            THEN retail_amount * COALESCE(quantity, 1) \
-                                        WHEN doc_type_name = 'Возврат' \
-                                            THEN -retail_amount * COALESCE(quantity, 1) \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as sum_for_contribution, \
-                   COALESCE(SUM( \
-                                    CASE \
-                                        WHEN bonus_type_name = 'От клиента при отмене' \
-                                            THEN COALESCE(return_amount, 1) \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as cancels_quantity, \
-                   COALESCE(SUM(CASE \
-                                    WHEN doc_type_name = 'Продажа' \
-                                        THEN ppvz_for_pay \
-                                    WHEN doc_type_name = 'Возврат' \
-                                        THEN -ppvz_for_pay \
-                                    ELSE 0 \
-                       END), 0)                                    as ppvz_for_pay, \
-                   COALESCE(AVG(NULLIF(commission_percent, 0)), 0) as commission, \
-                   COALESCE(SUM(delivery_rub), 0)                  as logistics, \
-                   COALESCE(SUM(penalty), 0)                       as penalties, \
-                   COALESCE(SUM(storage_fee), 0)                   as storage, \
-                   COALESCE(SUM(acceptance), 0)                    as acceptance, \
-                   COALESCE(SUM( \
-                                    CASE \
-                                        WHEN supplier_oper_name = 'Продажа' \
-                                            THEN COALESCE(quantity, 1) \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as sales_count, \
-                   COALESCE(SUM( \
-                                    CASE \
-                                        WHEN doc_type_name = 'Продажа' \
-                                            THEN COALESCE(quantity, 1) * \
-                                                 (COALESCE(c_price, 0) + COALESCE(fulfillment, 0)) \
-                                        WHEN doc_type_name = 'Возврат' \
-                                            THEN COALESCE(quantity, 1) * \
-                                                 (COALESCE(c_price, 0) + COALESCE(fulfillment, 0)) * -1 \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as sum_cost_price, \
-                   COALESCE(SUM( \
-                                    CASE \
-                                        WHEN supplier_oper_name = 'Удержание' and \
-                                             bonus_type_name NOT LIKE '%%WB Продвижение%%' \
-                                            THEN COALESCE(deduction, 0) \
-                                        ELSE 0 \
-                                        END \
-                            ), 0)                                  as deduction,
-                financial_reports.nm_id as nm_id,
-                Max(cost_price.url_photo) as product_image_url,
-                Max(cost_price.sa_name) as sa_name
-            FROM financial_reports
-                     left join cost_price on cost_price.nm_id = financial_reports.nm_id
-            WHERE financial_reports.user_id = %s
-              AND date_to::date >= %s:: date
-              AND date_to:: date <= %s:: date \
-
-            GROUP BY financial_reports.nm_id 
-            ORDER BY financial_reports.nm_id asc
-            """
+        SELECT 
+            COALESCE(SUM(
+                CASE 
+                    WHEN doc_type_name = 'Продажа' 
+                        THEN retail_price * COALESCE(quantity, 1) 
+                    ELSE 0 
+                END
+            ), 0) as revenue,
+            COALESCE(SUM(
+                CASE 
+                    WHEN doc_type_name = 'Возврат' 
+                        THEN retail_price 
+                    ELSE 0 
+                END
+            ), 0) as returns_sum,
+            COALESCE(SUM(
+                CASE 
+                    WHEN bonus_type_name = 'От клиента при возврате' 
+                        THEN COALESCE(return_amount, 1) 
+                    ELSE 0 
+                END
+            ), 0) as returns_quantity,
+            COALESCE(SUM(
+                CASE 
+                    WHEN bonus_type_name = 'От клиента при отмене' 
+                        THEN ABS(retail_amount * COALESCE(return_amount, 1)) 
+                    ELSE 0 
+                END
+            ), 0) as cancels_sum,
+            COALESCE(SUM(
+                CASE 
+                    WHEN doc_type_name = 'Продажа' 
+                        THEN retail_amount * COALESCE(quantity, 1) 
+                    WHEN doc_type_name = 'Возврат' 
+                        THEN -retail_amount * COALESCE(quantity, 1) 
+                    ELSE 0 
+                END
+            ), 0) as sum_for_contribution,
+            COALESCE(SUM(
+                CASE 
+                    WHEN bonus_type_name = 'От клиента при отмене' 
+                        THEN COALESCE(return_amount, 1) 
+                    ELSE 0 
+                END
+            ), 0) as cancels_quantity,
+            COALESCE(SUM(
+                CASE 
+                    WHEN doc_type_name = 'Продажа' 
+                        THEN ppvz_for_pay 
+                    WHEN doc_type_name = 'Возврат' 
+                        THEN -ppvz_for_pay 
+                    ELSE 0 
+                END
+            ), 0) as ppvz_for_pay,
+            COALESCE(AVG(NULLIF(commission_percent, 0)), 0) as commission,
+            COALESCE(SUM(delivery_rub), 0) as logistics,
+            COALESCE(SUM(penalty), 0) as penalties,
+            COALESCE(SUM(storage_fee), 0) as storage,
+            COALESCE(SUM(acceptance), 0) as acceptance,
+            COALESCE(SUM(
+                CASE 
+                    WHEN supplier_oper_name = 'Продажа' 
+                        THEN COALESCE(quantity, 1) 
+                    ELSE 0 
+                END
+            ), 0) as sales_count,
+            COALESCE(SUM(
+                CASE 
+                    WHEN doc_type_name = 'Продажа' 
+                        THEN COALESCE(quantity, 1) * (COALESCE(c_price, 0) + COALESCE(fulfillment, 0)) 
+                    WHEN doc_type_name = 'Возврат' 
+                        THEN COALESCE(quantity, 1) * (COALESCE(c_price, 0) + COALESCE(fulfillment, 0)) * -1 
+                    ELSE 0 
+                END
+            ), 0) as sum_cost_price,
+            COALESCE(SUM(
+                CASE 
+                    WHEN supplier_oper_name = 'Удержание' 
+                        AND bonus_type_name NOT LIKE '%%WB Продвижение%%' 
+                        THEN COALESCE(deduction, 0) 
+                    ELSE 0 
+                END
+            ), 0) as deduction,
+            financial_reports.nm_id as nm_id,
+            MAX(cost_price.url_photo) as product_image_url,
+            MAX(cost_price.sa_name) as sa_name
+        FROM financial_reports
+        LEFT JOIN cost_price ON cost_price.nm_id = financial_reports.nm_id
+        WHERE financial_reports.user_id = %s
+          AND date_to::date >= %s::date
+          AND date_to::date <= %s::date
+        GROUP BY financial_reports.nm_id 
+        ORDER BY financial_reports.nm_id ASC
+    """
 
     with get_cursor() as cursor:
         cursor.execute(query, (user_id, date_from, date_to))
@@ -509,8 +477,7 @@ def get_detail_for_period_from_report(
         if result:
             return [dict(row) for row in result]
 
-        return {
-        }
+        return []
 
 def get_dynamic_for_period_from_funnel(
     user_id: int,
@@ -648,74 +615,74 @@ def get_metrics_for_period_from_advert_stats(
         return {
             'ad_expense': 0
         }
+
+
 def get_dynamic_for_period_from_advert_stats(
     user_id: int,
     date_from: str,
     date_to: str
-) -> Dict[str, Any]:
+) -> List[Dict[str, Any]]:  # ← Тип возврата
     """
     Рассчитывает данные для динамики за период из advert_stats.
     """
     query = """
         SELECT 
-             SUM(sum) as ad_expense,
+            SUM(sum) as ad_expense,
             date_stat as date
-            FROM advert_fullstats
-            WHERE user_id = %(user_id)s
-              AND date_stat >= %(date_from)s::date
-              AND date_stat <= %(date_to)s::date
-            group by date_stat order by date_stat asc
+        FROM advert_fullstats
+        WHERE user_id = %(user_id)s
+          AND date_stat >= %(date_from)s::date
+          AND date_stat <= %(date_to)s::date
+        GROUP BY date_stat 
+        ORDER BY date_stat ASC
     """
 
     with get_cursor() as cursor:
         cursor.execute(query, {
-            "user_id":user_id,
-            "date_from":date_from,
-            "date_to":date_to
+            "user_id": user_id,
+            "date_from": date_from,
+            "date_to": date_to
         })
         result = cursor.fetchall()
 
         if result:
             return [dict(row) for row in result]
 
-        return {
-            'ad_expense': 0
-        }
+        return []
 
 
 def get_detail_for_period_from_advert_stats(
     user_id: int,
     date_from: str,
     date_to: str
-) -> Dict[str, Any]:
+) -> List[Dict[str, Any]]:  # ← Тип возврата
     """
-    Рассчитывает данные для динамики за период из advert_stats.
+    Рассчитывает данные детализации за период из advert_stats.
     """
     query = """
         SELECT 
-             SUM(sum) as ad_expense,
+            SUM(sum) as ad_expense,
             nm_id as nm_id
-            FROM advert_fullstats
-            WHERE user_id = %(user_id)s
-              AND date_stat >= %(date_from)s::date
-              AND date_stat <= %(date_to)s::date
-            group by nm_id order by nm_id asc
+        FROM advert_fullstats
+        WHERE user_id = %(user_id)s
+          AND date_stat >= %(date_from)s::date
+          AND date_stat <= %(date_to)s::date
+        GROUP BY nm_id 
+        ORDER BY nm_id ASC
     """
 
     with get_cursor() as cursor:
         cursor.execute(query, {
-            "user_id":user_id,
-            "date_from":date_from,
-            "date_to":date_to
+            "user_id": user_id,
+            "date_from": date_from,
+            "date_to": date_to
         })
         result = cursor.fetchall()
 
         if result:
             return [dict(row) for row in result]
 
-        return {
-            'ad_expense': 0
-        }
+        return []
 
 def get_metrics_for_period_from_funnel(
     user_id: int,
@@ -894,11 +861,7 @@ def insert_financial_reports(user_id: int, reports: List[Dict[str, Any]]) -> int
     """
     Вставляет или обновляет финансовые отчёты в БД.
 
-    ЛОГИКА: UPSERT по rrd_id
-    - Если запись с таким rrd_id есть — обновляем все поля
-    - Если нет — вставляем новую
-
-    Это позволяет синхронизировать изменённые данные от WB.
+    ЛОГИКА: UPSERT по rrd_id с BATCH обработкой для экономии памяти.
     """
     if not reports:
         return 0
@@ -913,9 +876,9 @@ def insert_financial_reports(user_id: int, reports: List[Dict[str, Any]]) -> int
         f"User {user_id}: валидировано {len(validated_reports)} из {len(reports)} записей"
     )
 
-    db_rows = [report.to_db_dict(user_id) for report in validated_reports]
+    # ⚡ Освобождаем оригинальные данные
+    del reports
 
-    # Все поля для вставки (rrd_id теперь обязательное!)
     fields = [
         "rrd_id", "user_id", "realizationreport_id", "date_from", "date_to", "create_dt",
         "currency_name", "suppliercontract_code", "gi_id", "dlv_prc",
@@ -938,33 +901,7 @@ def insert_financial_reports(user_id: int, reports: List[Dict[str, Any]]) -> int
         "cashback_amount", "cashback_discount", "cashback_commission_change", "order_uid"
     ]
 
-    def prepare_row(row_dict: dict) -> tuple:
-        import json
-        values = []
-        for field in fields:
-            value = row_dict.get(field)
-            if field == "suppliercontract_code" and value is not None:
-                if not isinstance(value, str):
-                    value = json.dumps(value)
-            values.append(value)
-        return tuple(values)
-
-    values = [prepare_row(row) for row in db_rows]
-
-    # Фильтруем записи без rrd_id (они не могут быть вставлены)
-    valid_values = [v for v in values if v[0] is not None]
-    skipped = len(values) - len(valid_values)
-
-    if skipped > 0:
-        logger.warning(f"User {user_id}: пропущено {skipped} записей без rrd_id")
-
-    if not valid_values:
-        logger.warning(f"User {user_id}: нет записей с rrd_id для вставки")
-        return 0
-
     fields_str = ", ".join(fields)
-
-    # Поля для обновления (все кроме rrd_id)
     update_fields = [f for f in fields if f != "rrd_id"]
     update_str = ", ".join([f"{f} = EXCLUDED.{f}" for f in update_fields])
 
@@ -975,17 +912,53 @@ def insert_financial_reports(user_id: int, reports: List[Dict[str, Any]]) -> int
         DO UPDATE SET {update_str}
     """
 
+    def prepare_row(row_dict: dict) -> tuple:
+        values = []
+        for field in fields:
+            value = row_dict.get(field)
+            if field == "suppliercontract_code" and value is not None:
+                if not isinstance(value, str):
+                    value = json.dumps(value)
+            values.append(value)
+        return tuple(values)
+
+    # ⚡ BATCH ОБРАБОТКА — не держим всё в памяти
+    BATCH_SIZE = 5000
+    total_affected = 0
+    skipped_total = 0
+
     with get_cursor(commit=True) as cursor:
-        try:
-            execute_values(cursor, query, valid_values, page_size=1000)
-            affected_count = cursor.rowcount
-            logger.info(
-                f"User {user_id}: отчёты — вставлено/обновлено {affected_count} записей"
-            )
-            return affected_count
-        except Exception as e:
-            logger.error(f"User {user_id}: ошибка вставки данных: {e}")
-            raise
+        for i in range(0, len(validated_reports), BATCH_SIZE):
+            batch = validated_reports[i:i + BATCH_SIZE]
+
+            # Конвертируем батч
+            db_rows = [report.to_db_dict(user_id) for report in batch]
+            values = [prepare_row(row) for row in db_rows]
+
+            # Фильтруем без rrd_id
+            valid_values = [v for v in values if v[0] is not None]
+            skipped_total += len(values) - len(valid_values)
+
+            if valid_values:
+                try:
+                    execute_values(cursor, query, valid_values, page_size=1000)
+                    total_affected += cursor.rowcount
+                except Exception as e:
+                    logger.error(f"User {user_id}: ошибка batch {i // BATCH_SIZE + 1}: {e}")
+                    raise
+
+            # ⚡ Освобождаем память батча
+            del batch, db_rows, values, valid_values
+
+        # ⚡ Освобождаем validated_reports после цикла
+        del validated_reports
+
+    if skipped_total > 0:
+        logger.warning(f"User {user_id}: пропущено {skipped_total} записей без rrd_id")
+
+    logger.info(f"User {user_id}: отчёты — вставлено/обновлено {total_affected} записей")
+    return total_affected
+
 
 
 def cleanup_old_reports(months: int = None) -> int:
@@ -1051,17 +1024,7 @@ def insert_funnel_products(
     """
     Вставляет или обновляет данные воронки продаж в БД.
 
-    ЛОГИКА: UPSERT по (user_id, nm_id, date_funnel)
-    - Если запись существует — обновляем все поля
-    - Если нет — вставляем новую
-
-    Args:
-        user_id: ID пользователя
-        products: Сырые данные из WB API
-        extract_both_periods: Извлекать оба периода (selected + past)
-
-    Returns:
-        Количество вставленных/обновлённых записей
+    ЛОГИКА: UPSERT по (user_id, nm_id, date_funnel) с BATCH обработкой.
     """
     from models.funnel_product import (
         validate_funnel_products,
@@ -1089,10 +1052,10 @@ def insert_funnel_products(
         logger.warning(f"User {user_id}: все записи воронки отклонены при валидации")
         return 0
 
-    # ===== ШАГ 2: Преобразование в словари для БД =====
-    db_rows = [product.to_db_dict(user_id) for product in validated_products]
+    # ⚡ Освобождаем оригинальные данные
+    del products
 
-    # ===== ШАГ 3: Формируем список полей =====
+    # ===== ШАГ 2: Формируем список полей =====
     fields = [
         "user_id", "nm_id", "vendor_code", "brand_name",
         "stocks_wb", "stocks_mp", "stocks_balance_sum",
@@ -1104,19 +1067,7 @@ def insert_funnel_products(
         "conversions_buyout_percent"
     ]
 
-    # ===== ШАГ 4: Подготовка значений =====
-    def prepare_row(row_dict: dict) -> tuple:
-        values = []
-        for field in fields:
-            value = row_dict.get(field)
-            values.append(value)
-        return tuple(values)
-
-    values = [prepare_row(row) for row in db_rows]
-
-    # ===== ШАГ 5: INSERT с ON CONFLICT DO UPDATE =====
     fields_str = ", ".join(fields)
-
     update_fields = [f for f in fields if f not in ("user_id", "nm_id", "date_funnel")]
     update_str = ", ".join([f"{f} = EXCLUDED.{f}" for f in update_fields])
 
@@ -1127,17 +1078,37 @@ def insert_funnel_products(
         DO UPDATE SET {update_str}
     """
 
+    def prepare_row(row_dict: dict) -> tuple:
+        return tuple(row_dict.get(field) for field in fields)
+
+    # ⚡ BATCH ОБРАБОТКА
+    BATCH_SIZE = 5000
+    total_affected = 0
+
     with get_cursor(commit=True) as cursor:
-        try:
-            execute_values(cursor, query, values, page_size=1000)
-            affected_count = cursor.rowcount
-            logger.info(
-                f"User {user_id}: воронка — вставлено/обновлено {affected_count} записей"
-            )
-            return affected_count
-        except Exception as e:
-            logger.error(f"User {user_id}: ошибка вставки воронки: {e}")
-            raise
+        for i in range(0, len(validated_products), BATCH_SIZE):
+            batch = validated_products[i:i + BATCH_SIZE]
+
+            # Конвертируем батч
+            db_rows = [product.to_db_dict(user_id) for product in batch]
+            values = [prepare_row(row) for row in db_rows]
+
+            if values:
+                try:
+                    execute_values(cursor, query, values, page_size=1000)
+                    total_affected += cursor.rowcount
+                except Exception as e:
+                    logger.error(f"User {user_id}: ошибка batch воронки {i // BATCH_SIZE + 1}: {e}")
+                    raise
+
+            # ⚡ Освобождаем память батча
+            del batch, db_rows, values
+
+        # ⚡ Освобождаем validated_products после цикла
+        del validated_products
+
+    logger.info(f"User {user_id}: воронка — вставлено/обновлено {total_affected} записей")
+    return total_affected
 
 
 def cleanup_old_funnel_data(months: int = None) -> int:

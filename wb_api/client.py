@@ -8,12 +8,19 @@ from typing import List, Dict, Any, Optional, Tuple
 from config import config
 from utils import logger
 
+
 class InvalidTokenError(Exception):
     """Выбрасывается, когда API возвращает 401 Unauthorized."""
     pass
 
+
 class WBApiClient:
-    """Клиент для работы с WB API"""
+    """
+    Клиент для работы с WB API.
+
+    Использует единый HTTP клиент с connection pooling
+    для экономии памяти и ускорения запросов.
+    """
 
     def __init__(self, token: str):
         self.token = token
@@ -27,15 +34,54 @@ class WBApiClient:
         self.max_days = config.WB_API_MAX_DAYS_PER_REQUEST
         self.retry_delay = config.WB_API_RETRY_DELAY
 
+        # ═══════════════════════════════════════════════════════════
+        # ⚡ ОПТИМИЗАЦИЯ: Единый HTTP клиент с connection pooling
+        # ═══════════════════════════════════════════════════════════
+        self._http_client = httpx.Client(
+            timeout=httpx.Timeout(
+                timeout=60.0,
+                connect=10.0,
+                read=60.0,
+                write=10.0,
+                pool=5.0
+            ),
+            limits=httpx.Limits(
+                max_connections=10,
+                max_keepalive_connections=5,
+                keepalive_expiry=30.0
+            ),
+            headers=self.headers,
+            follow_redirects=True
+        )
+
+    def close(self):
+        """Закрывает HTTP клиент и освобождает соединения"""
+        if hasattr(self, '_http_client') and self._http_client is not None:
+            try:
+                self._http_client.close()
+            except Exception as e:
+                logger.debug(f"Ошибка при закрытии HTTP клиента: {e}")
+            finally:
+                self._http_client = None
+
+    def __enter__(self):
+        """Поддержка контекстного менеджера"""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Автоматическое закрытие при выходе из контекста"""
+        self.close()
+
+    def __del__(self):
+        """Автоматическое закрытие при удалении объекта"""
+        self.close()
+
     def _split_period(
         self,
         start_date: date,
         end_date: date
     ) -> List[Tuple[date, date]]:
-        """
-        Разбивает период на интервалы по max_days дней.
-        WB API ограничивает период в 31 день на один запрос.
-        """
+        """Разбивает период на интервалы по max_days дней."""
         if start_date > end_date:
             raise ValueError("Начальная дата должна быть раньше конечной")
 
@@ -63,12 +109,7 @@ class WBApiClient:
         date_to: date,
         user_id: Optional[int] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Получает финансовые отчёты за период.
-        Автоматически разбивает на интервалы и обрабатывает rate limits.
-
-        Endpoint: GET /api/v5/supplier/reportDetailByPeriod
-        """
+        """Получает финансовые отчёты за период."""
         all_reports = []
         intervals = self._split_period(date_from, date_to)
         log_prefix = f"User {user_id}: " if user_id else ""
@@ -103,9 +144,7 @@ class WBApiClient:
         user_id: Optional[int] = None,
         max_retries: int = 3
     ) -> List[Dict[str, Any]]:
-        """
-        Получает отчёты за один интервал с обработкой ошибок.
-        """
+        """Получает отчёты за один интервал."""
         url = f"{self.base_report_url}/api/v5/supplier/reportDetailByPeriod"
         params = {
             "dateFrom": self._format_date(date_from),
@@ -116,48 +155,46 @@ class WBApiClient:
 
         for attempt in range(max_retries):
             try:
-                with httpx.Client(timeout=60.0) as client:
-                    response = client.get(url, params=params, headers=self.headers)
+                # ✅ Используем переиспользуемый клиент
+                response = self._http_client.get(url, params=params)
 
-                    if response.status_code == 200:
-                        data = response.json()
+                if response.status_code == 200:
+                    data = response.json()
 
-                        if isinstance(data, list):
-                            logger.debug(
-                                f"{log_prefix}Получено {len(data)} записей "
-                                f"за {date_from} - {date_to}"
-                            )
-                            return data
-                        elif isinstance(data, dict):
-                            return data.get("data", [])
-
-                        return []
-
-                    elif response.status_code == 429:
-                        logger.warning(
-                            f"{log_prefix}Rate limit (429), ожидание {self.retry_delay}с... "
-                            f"(попытка {attempt + 1}/{max_retries})"
-                        )
-                        time.sleep(self.retry_delay)
-                        continue
-
-                    elif response.status_code == 401:
-                        logger.error(
-                            f"{log_prefix}Невалидный токен (401): {response.text}"
-                        )
-                        return []
-
-                    elif response.status_code == 204:
+                    if isinstance(data, list):
                         logger.debug(
-                            f"{log_prefix}Нет данных за период {date_from} - {date_to}"
+                            f"{log_prefix}Получено {len(data)} записей "
+                            f"за {date_from} - {date_to}"
                         )
-                        return []
+                        return data
+                    elif isinstance(data, dict):
+                        return data.get("data", [])
 
-                    else:
-                        logger.error(
-                            f"{log_prefix}Ошибка API: {response.status_code} - {response.text}"
-                        )
-                        return []
+                    return []
+
+                elif response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After", self.retry_delay)
+                    wait_time = int(retry_after) if retry_after else self.retry_delay
+                    logger.warning(
+                        f"{log_prefix}Rate limit (429), ожидание {wait_time}с... "
+                        f"(попытка {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(wait_time)
+                    continue
+
+                elif response.status_code == 401:
+                    logger.error(f"{log_prefix}Невалидный токен (401): {response.text}")
+                    return []
+
+                elif response.status_code == 204:
+                    logger.debug(f"{log_prefix}Нет данных за период {date_from} - {date_to}")
+                    return []
+
+                else:
+                    logger.error(
+                        f"{log_prefix}Ошибка API: {response.status_code} - {response.text}"
+                    )
+                    return []
 
             except httpx.TimeoutException:
                 logger.warning(
@@ -177,7 +214,7 @@ class WBApiClient:
         return []
 
     # ═══════════════════════════════════════════════════════════════
-    # ВОРОНКА ПРОДАЖ (FUNNEL PRODUCTS)
+    # ВОРОНКА ПРОДАЖ
     # ═══════════════════════════════════════════════════════════════
 
     def get_funnel_products(
@@ -186,22 +223,7 @@ class WBApiClient:
         past_date: Optional[date] = None,
         user_id: Optional[int] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Получает воронку продаж по товарам.
-
-        Возвращает сырые данные, из которых можно извлечь ОБА периода
-        (selected + past). Это сокращает количество запросов вдвое!
-
-        Args:
-            selected_date: Дата selected периода
-            past_date: Дата past периода (по умолчанию = selected_date - 1 день)
-            user_id: ID пользователя (для логирования)
-
-        Returns:
-            Список сырых данных товаров (для дальнейшей обработки)
-
-        Endpoint: POST /api/analytics/v3/sales-funnel/products
-        """
+        """Получает воронку продаж по товарам."""
         if past_date is None:
             past_date = selected_date - timedelta(days=1)
 
@@ -214,7 +236,13 @@ class WBApiClient:
             f"{log_prefix}Запрос воронки: selected={selected_date}, past={past_date}"
         )
 
-        while True:
+        # ⚡ Защита от бесконечного цикла
+        max_pages = 1000
+        page_count = 0
+
+        while page_count < max_pages:
+            page_count += 1
+
             products, has_more = self._fetch_funnel_page(
                 selected_date=selected_date,
                 past_date=past_date,
@@ -229,7 +257,7 @@ class WBApiClient:
                 if len(products) >= 990:
                     logger.warning(
                         f"{log_prefix}Воронка: получено {len(products)} записей "
-                        f"(близко к лимиту 1000!) — выполняется пагинация"
+                        f"(близко к лимиту 1000!)"
                     )
 
                 logger.debug(
@@ -243,9 +271,15 @@ class WBApiClient:
             offset += limit
             time.sleep(0.5)
 
+        if page_count >= max_pages:
+            logger.error(
+                f"{log_prefix}Достигнут лимит страниц ({max_pages}) — "
+                f"возможна некорректная пагинация"
+            )
+
         logger.info(
             f"{log_prefix}Воронка за {past_date} и {selected_date}: "
-            f"всего {len(all_products)} товаров (×2 периода)"
+            f"всего {len(all_products)} товаров"
         )
 
         return all_products
@@ -259,15 +293,7 @@ class WBApiClient:
         user_id: Optional[int] = None,
         max_retries: int = 3
     ) -> Tuple[List[Dict[str, Any]], bool]:
-        """
-        Получает одну страницу воронки продаж.
-
-        Returns:
-            Tuple[список товаров, есть ли ещё данные]
-
-        Raises:
-            PermissionError: Если токен не имеет нужного scope
-        """
+        """Получает одну страницу воронки продаж."""
         base_url = self.base_funnel_url.rstrip('/')
         url = f"{base_url}/api/analytics/v3/sales-funnel/products"
         log_prefix = f"User {user_id}: " if user_id else ""
@@ -288,80 +314,60 @@ class WBApiClient:
 
         for attempt in range(max_retries):
             try:
-                with httpx.Client(timeout=60.0) as client:
-                    response = client.post(
-                        url,
-                        json=payload,
-                        headers=self.headers
+                # ✅ Используем переиспользуемый клиент
+                response = self._http_client.post(url, json=payload)
+
+                if response.status_code == 200:
+                    data = response.json()
+
+                    if isinstance(data, dict):
+                        products = data.get("data", {}).get("products", [])
+                        has_more = len(products) >= limit
+                        return products, has_more
+
+                    return [], False
+
+                elif response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After", self.retry_delay)
+                    wait_time = int(retry_after) if retry_after else self.retry_delay
+                    logger.warning(
+                        f"{log_prefix}Rate limit (429), ожидание {wait_time}с... "
+                        f"(попытка {attempt + 1}/{max_retries})"
                     )
+                    time.sleep(wait_time)
+                    continue
 
-                    if response.status_code == 200:
-                        data = response.json()
+                elif response.status_code == 401:
+                    error_text = response.text
 
-                        if isinstance(data, dict):
-                            products = data.get("data", {}).get("products", [])
-                            has_more = len(products) >= limit
-                            return products, has_more
+                    try:
+                        error_data = response.json()
+                        error_detail = error_data.get("detail", "")
 
-                        return [], False
+                        if "scope" in error_detail.lower():
+                            logger.error(f"{log_prefix}Ошибка прав (Scope): {error_detail}")
+                            raise PermissionError(f"Token scope not allowed: {error_detail}")
 
-                    elif response.status_code == 429:
-                        logger.warning(
-                            f"{log_prefix}Rate limit (429), ожидание {self.retry_delay}с... "
-                            f"(попытка {attempt + 1}/{max_retries})"
-                        )
-                        time.sleep(self.retry_delay)
-                        continue
+                        logger.error(f"{log_prefix}Критическая ошибка токена (401): {error_text}")
+                        raise InvalidTokenError(f"Unauthorized: {error_detail or error_text}")
 
+                    except (PermissionError, InvalidTokenError):
+                        raise
 
-                    elif response.status_code == 401:
+                    except Exception:
+                        logger.error(f"{log_prefix}Невалидный токен (401): {error_text}")
+                        raise InvalidTokenError(f"Unauthorized: {error_text}")
 
-                        error_text = response.text
+                elif response.status_code == 204:
+                    logger.debug(f"{log_prefix}Нет данных воронки за {selected_date}")
+                    return [], False
 
-                        try:
-
-                            error_data = response.json()
-
-                            error_detail = error_data.get("detail", "")
-
-                            if "scope" in error_detail.lower():
-                                logger.error(f"{log_prefix}Ошибка прав (Scope): {error_detail}")
-
-                                raise PermissionError(f"Token scope not allowed: {error_detail}")
-
-                            # Если это не ошибка scope, значит токен в принципе «битый»
-
-                            logger.error(f"{log_prefix}Критическая ошибка токена (401): {error_text}")
-
-                            raise InvalidTokenError(f"Unauthorized: {error_detail or error_text}")
-
-
-                        except (PermissionError, InvalidTokenError):
-
-                            # Пробрасываем наши спец. исключения дальше, чтобы выйти из всех циклов
-
-                            raise
-
-                        except Exception:
-
-                            # На случай, если JSON не распарсился, но статус 401
-
-                            logger.error(f"{log_prefix}Невалидный токен (401): {error_text}")
-
-                            raise InvalidTokenError(f"Unauthorized: {error_text}")
-
-                    elif response.status_code == 204:
-                        logger.debug(
-                            f"{log_prefix}Нет данных воронки за {selected_date}"
-                        )
-                        return [], False
-
-                    else:
-                        logger.error(
-                            f"{log_prefix}Ошибка API воронки: "
-                            f"{response.status_code} - {response.text}"
-                        )
-                        return [], False
+                else:
+                    logger.error(
+                        f"{log_prefix}Ошибка API воронки: "
+                        f"{response.status_code} - {response.text}"
+                    )
+                    return [], False
 
             except PermissionError:
                 raise
@@ -385,52 +391,45 @@ class WBApiClient:
         return [], False
 
     # ═══════════════════════════════════════════════════════════════
-    # РЕКЛАМНАЯ СТАТИСТИКА (ADVERT FULLSTATS)
+    # РЕКЛАМНАЯ СТАТИСТИКА
     # ═══════════════════════════════════════════════════════════════
 
     def get_promotion_advert_ids(
         self,
         user_id: Optional[int] = None
     ) -> List[int]:
-        """
-        Получает список всех advertId из /adv/v1/promotion/count.
-
-        Returns:
-            Список ID рекламных кампаний
-        """
+        """Получает список ID рекламных кампаний."""
         from models.advert_stats import extract_advert_ids
 
         url = f"{self.base_advert_url}/adv/v1/promotion/count"
         log_prefix = f"User {user_id}: " if user_id else ""
 
         try:
-            with httpx.Client(timeout=60.0) as client:
-                response = client.get(url, headers=self.headers)
+            # ✅ Используем переиспользуемый клиент
+            response = self._http_client.get(url)
 
-                if response.status_code == 200:
-                    data = response.json()
-                    advert_ids = extract_advert_ids(data)
-                    logger.debug(
-                        f"{log_prefix}Получено {len(advert_ids)} рекламных кампаний"
-                    )
-                    return advert_ids
+            if response.status_code == 200:
+                data = response.json()
+                advert_ids = extract_advert_ids(data)
+                logger.debug(
+                    f"{log_prefix}Получено {len(advert_ids)} рекламных кампаний"
+                )
+                return advert_ids
 
-                elif response.status_code == 401:
-                    logger.warning(
-                        f"{log_prefix}Нет доступа к рекламному API (401)"
-                    )
-                    raise PermissionError("No access to advert API")
+            elif response.status_code == 401:
+                logger.warning(f"{log_prefix}Нет доступа к рекламному API (401)")
+                raise PermissionError("No access to advert API")
 
-                elif response.status_code == 204:
-                    logger.debug(f"{log_prefix}Нет рекламных кампаний")
-                    return []
+            elif response.status_code == 204:
+                logger.debug(f"{log_prefix}Нет рекламных кампаний")
+                return []
 
-                else:
-                    logger.error(
-                        f"{log_prefix}Ошибка API promotion/count: "
-                        f"{response.status_code} - {response.text}"
-                    )
-                    return []
+            else:
+                logger.error(
+                    f"{log_prefix}Ошибка API promotion/count: "
+                    f"{response.status_code} - {response.text}"
+                )
+                return []
 
         except PermissionError:
             raise
@@ -445,23 +444,7 @@ class WBApiClient:
         date_to: date,
         user_id: Optional[int] = None
     ) -> List[Any]:
-        """
-        Получает полную статистику по рекламным кампаниям.
-
-        Автоматически:
-        - Разбивает период на интервалы по 31 дню (ограничение WB API)
-        - Разбивает advert_ids на пачки по 50
-        - Обрабатывает rate limits
-
-        Args:
-            advert_ids: Список ID рекламных кампаний
-            date_from: Начало периода
-            date_to: Конец периода
-            user_id: ID пользователя (для логов)
-
-        Returns:
-            Список распарсенных строк статистики (AdvertStatsRow)
-        """
+        """Получает полную статистику по рекламным кампаниям."""
         from models.advert_stats import AdvertStatsRow
 
         if not advert_ids:
@@ -470,19 +453,13 @@ class WBApiClient:
         log_prefix = f"User {user_id}: " if user_id else ""
         all_stats: List[AdvertStatsRow] = []
 
-        # ═══════════════════════════════════════════════════════════
-        # ШАГ 1: Разбиваем период на интервалы по 31 дню
-        # ═══════════════════════════════════════════════════════════
         intervals = self._split_period(date_from, date_to)
 
         logger.debug(
             f"{log_prefix}Период {date_from} - {date_to} разбит на "
-            f"{len(intervals)} интервалов по {self.max_days} дней"
+            f"{len(intervals)} интервалов"
         )
 
-        # ═══════════════════════════════════════════════════════════
-        # ШАГ 2: Разбиваем advertId на пачки по 50
-        # ═══════════════════════════════════════════════════════════
         batch_size = 50
         batches = [
             advert_ids[i:i + batch_size]
@@ -497,9 +474,6 @@ class WBApiClient:
             f"{total_requests} запросов"
         )
 
-        # ═══════════════════════════════════════════════════════════
-        # ШАГ 3: Для каждого интервала и каждой пачки делаем запрос
-        # ═══════════════════════════════════════════════════════════
         request_num = 0
 
         for interval_idx, (interval_start, interval_end) in enumerate(intervals):
@@ -521,17 +495,13 @@ class WBApiClient:
                 )
                 all_stats.extend(batch_stats)
 
-                # Пауза между запросами (rate limit)
                 if request_num < total_requests:
                     time.sleep(1)
 
-            # Дополнительная пауза между интервалами
             if interval_idx < len(intervals) - 1:
                 time.sleep(0.5)
 
-        logger.info(
-            f"{log_prefix}Получено записей advert stats: {len(all_stats)}"
-        )
+        logger.info(f"{log_prefix}Получено записей advert stats: {len(all_stats)}")
 
         return all_stats
 
@@ -545,22 +515,12 @@ class WBApiClient:
         total_batches: int = 1,
         max_retries: int = 3
     ) -> List[Any]:
-        """
-        Получает статистику для одной пачки advertId.
-
-        Endpoint: GET /adv/v3/fullstats
-
-        Query Parameters:
-            ids: строка с ID через запятую (максимум 50)
-            beginDate: дата начала (YYYY-MM-DD)
-            endDate: дата окончания (YYYY-MM-DD)
-        """
-        from models.advert_stats import extract_advert_stats, AdvertStatsRow
+        """Получает статистику для одной пачки advertId."""
+        from models.advert_stats import extract_advert_stats
 
         url = f"{self.base_advert_url}/adv/v3/fullstats"
         log_prefix = f"User {user_id}: " if user_id else ""
 
-        # Формируем query параметры
         params = {
             "ids": ",".join(str(id) for id in advert_ids),
             "beginDate": self._format_date(begin_date),
@@ -569,59 +529,57 @@ class WBApiClient:
 
         for attempt in range(max_retries):
             try:
-                with httpx.Client(timeout=120.0) as client:
-                    response = client.get(
-                        url,
-                        params=params,
-                        headers=self.headers
-                    )
+                # ✅ Используем переиспользуемый клиент (таймаут 60.0 сек)
+                response = self._http_client.get(
+                    url,
+                    params=params,
+                    timeout=60.0
+                )
 
-                    if response.status_code == 200:
-                        data = response.json()
+                if response.status_code == 200:
+                    data = response.json()
 
-                        if isinstance(data, list):
-                            stats = extract_advert_stats(data)
-                            logger.debug(
-                                f"{log_prefix}Пачка {batch_num}/{total_batches}: "
-                                f"{len(stats)} записей"
-                            )
-                            return stats
-
-                        return []
-
-                    elif response.status_code == 429:
-                        logger.warning(
-                            f"{log_prefix}Rate limit (429), ожидание {self.retry_delay}с... "
-                            f"(попытка {attempt + 1}/{max_retries})"
-                        )
-                        time.sleep(self.retry_delay)
-                        continue
-
-                    elif response.status_code == 401:
-                        logger.warning(
-                            f"{log_prefix}Нет доступа к fullstats (401)"
-                        )
-                        raise PermissionError("No access to advert fullstats API")
-
-                    elif response.status_code == 204:
+                    if isinstance(data, list):
+                        stats = extract_advert_stats(data)
                         logger.debug(
-                            f"{log_prefix}Пачка {batch_num}/{total_batches}: нет данных"
-                        )
-                        return []
-
-                    elif response.status_code == 400:
-                        logger.warning(
                             f"{log_prefix}Пачка {batch_num}/{total_batches}: "
-                            f"ошибка запроса (400) - {response.text}"
+                            f"{len(stats)} записей"
                         )
-                        return []
+                        return stats
 
-                    else:
-                        logger.error(
-                            f"{log_prefix}Ошибка API fullstats: "
-                            f"{response.status_code} - {response.text}"
-                        )
-                        return []
+                    return []
+
+                elif response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After", self.retry_delay)
+                    wait_time = int(retry_after) if retry_after else self.retry_delay
+                    logger.warning(
+                        f"{log_prefix}Rate limit (429), ожидание {wait_time}с... "
+                        f"(попытка {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(wait_time)
+                    continue
+
+                elif response.status_code == 401:
+                    logger.warning(f"{log_prefix}Нет доступа к fullstats (401)")
+                    raise PermissionError("No access to advert fullstats API")
+
+                elif response.status_code == 204:
+                    logger.debug(f"{log_prefix}Пачка {batch_num}/{total_batches}: нет данных")
+                    return []
+
+                elif response.status_code == 400:
+                    logger.warning(
+                        f"{log_prefix}Пачка {batch_num}/{total_batches}: "
+                        f"ошибка запроса (400) - {response.text}"
+                    )
+                    return []
+
+                else:
+                    logger.error(
+                        f"{log_prefix}Ошибка API fullstats: "
+                        f"{response.status_code} - {response.text}"
+                    )
+                    return []
 
             except PermissionError:
                 raise
@@ -646,33 +604,28 @@ class WBApiClient:
         return []
 
     # ═══════════════════════════════════════════════════════════════
-    # КАРТОЧКИ ТОВАРОВ (ФОТО)
+    # КАРТОЧКИ ТОВАРОВ
     # ═══════════════════════════════════════════════════════════════
 
     def get_cards_list(
         self,
         user_id: Optional[int] = None
     ) -> Dict[int, str]:
-        """
-        Получает список карточек товаров с фотографиями.
-        Использует пагинацию через cursor для получения ВСЕХ карточек.
-
-        Endpoint: POST https://content-api.wildberries.ru/content/v2/get/cards/list
-
-        Returns:
-            Словарь {nmID: url_photo} — первое фото каждой карточки (c246x328)
-        """
+        """Получает список карточек товаров с фотографиями."""
         url = "https://content-api.wildberries.ru/content/v2/get/cards/list"
         log_prefix = f"User {user_id}: " if user_id else ""
 
         all_cards: Dict[int, str] = {}
-        cursor_nm_id = 0  # Начальный курсор
+        cursor_nm_id = 0
         cursor_updated_at = ""
         page = 0
 
         logger.debug(f"{log_prefix}Запрос карточек товаров (фото)")
 
-        while True:
+        # ⚡ Защита от бесконечного цикла
+        max_pages = 1000
+
+        while page < max_pages:
             page += 1
             cards_batch, next_cursor = self._fetch_cards_page(
                 cursor_nm_id=cursor_nm_id,
@@ -684,13 +637,17 @@ class WBApiClient:
             if cards_batch:
                 all_cards.update(cards_batch)
 
-            # Если вернулось меньше 100 карточек — это последняя страница
             if next_cursor is None or len(cards_batch) < 100:
                 break
 
             cursor_nm_id = next_cursor["nmID"]
             cursor_updated_at = next_cursor["updatedAt"]
-            time.sleep(0.5)  # Пауза между страницами
+            time.sleep(0.5)
+
+        if page >= max_pages:
+            logger.error(
+                f"{log_prefix}Достигнут лимит страниц карточек ({max_pages})"
+            )
 
         logger.info(
             f"{log_prefix}Получено карточек с фото: {len(all_cards)} "
@@ -707,101 +664,77 @@ class WBApiClient:
         page: int = 1,
         max_retries: int = 3
     ) -> Tuple[Dict[int, str], Optional[Dict]]:
-        """
-        Получает одну страницу карточек товаров.
-
-        Returns:
-            Tuple[
-                Dict[nmID, url_photo],  — карточки с этой страницы
-                Optional[Dict]          — курсор для следующей страницы (или None)
-            ]
-        """
+        """Получает одну страницу карточек товаров."""
         url = "https://content-api.wildberries.ru/content/v2/get/cards/list"
         log_prefix = f"User {user_id}: " if user_id else ""
 
-        # Формируем тело запроса
         payload = {
             "settings": {
-                "sort": {
-                    "ascending": True
-                },
-                "cursor": {
-                    "limit": 100
-                },
-                "filter": {
-                    "withPhoto": -1
-                }
+                "sort": {"ascending": True},
+                "cursor": {"limit": 100},
+                "filter": {"withPhoto": -1}
             }
         }
 
-        # Добавляем курсор для пагинации (кроме первой страницы)
         if cursor_nm_id > 0:
             payload["settings"]["cursor"]["nmID"] = cursor_nm_id
             payload["settings"]["cursor"]["updatedAt"] = cursor_updated_at
 
         for attempt in range(max_retries):
             try:
-                with httpx.Client(timeout=60.0) as client:
-                    response = client.post(
-                        url,
-                        json=payload,
-                        headers=self.headers
+                # ✅ Используем переиспользуемый клиент
+                response = self._http_client.post(url, json=payload)
+
+                if response.status_code == 200:
+                    data = response.json()
+                    cards = data.get("cards", [])
+                    cursor_data = data.get("cursor", {})
+
+                    result: Dict[int, str] = {}
+                    for card in cards:
+                        nm_id = card.get("nmID")
+                        photos = card.get("photos", [])
+
+                        if nm_id and photos:
+                            first_photo = photos[0]
+                            photo_url = first_photo.get("c246x328", "")
+                            if photo_url:
+                                result[nm_id] = photo_url
+
+                    logger.debug(
+                        f"{log_prefix}Карточки стр.{page}: "
+                        f"{len(result)} с фото из {len(cards)} карточек"
                     )
 
-                    if response.status_code == 200:
-                        data = response.json()
-                        cards = data.get("cards", [])
-                        cursor_data = data.get("cursor", {})
+                    next_cursor = None
+                    if cards and cursor_data:
+                        next_cursor = {
+                            "nmID": cursor_data.get("nmID", 0),
+                            "updatedAt": cursor_data.get("updatedAt", "")
+                        }
 
-                        # Извлекаем nmID -> первое фото (c246x328)
-                        result: Dict[int, str] = {}
-                        for card in cards:
-                            nm_id = card.get("nmID")
-                            photos = card.get("photos", [])
+                    return result, next_cursor
 
-                            if nm_id and photos:
-                                # Берём первое фото, размер c246x328
-                                first_photo = photos[0]
-                                photo_url = first_photo.get("c246x328", "")
-                                if photo_url:
-                                    result[nm_id] = photo_url
+                elif response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After", self.retry_delay)
+                    wait_time = int(retry_after) if retry_after else self.retry_delay
+                    logger.warning(
+                        f"{log_prefix}Rate limit (429) cards, ожидание {wait_time}с... "
+                        f"(попытка {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(wait_time)
+                    continue
 
-                        logger.debug(
-                            f"{log_prefix}Карточки стр.{page}: "
-                            f"{len(result)} с фото из {len(cards)} карточек"
-                        )
+                elif response.status_code == 401:
+                    logger.warning(f"{log_prefix}Нет доступа к content API (401)")
+                    raise PermissionError("No access to content API")
 
-                        # Формируем курсор для следующей страницы
-                        next_cursor = None
-                        if cards and cursor_data:
-                            next_cursor = {
-                                "nmID": cursor_data.get("nmID", 0),
-                                "updatedAt": cursor_data.get("updatedAt", "")
-                            }
-
-                        return result, next_cursor
-
-                    elif response.status_code == 429:
-                        logger.warning(
-                            f"{log_prefix}Rate limit (429) cards, "
-                            f"ожидание {self.retry_delay}с... "
-                            f"(попытка {attempt + 1}/{max_retries})"
-                        )
-                        time.sleep(self.retry_delay)
-                        continue
-
-                    elif response.status_code == 401:
-                        logger.warning(
-                            f"{log_prefix}Нет доступа к content API (401)"
-                        )
-                        raise PermissionError("No access to content API")
-
-                    else:
-                        logger.error(
-                            f"{log_prefix}Ошибка API cards/list: "
-                            f"{response.status_code} - {response.text}"
-                        )
-                        return {}, None
+                else:
+                    logger.error(
+                        f"{log_prefix}Ошибка API cards/list: "
+                        f"{response.status_code} - {response.text}"
+                    )
+                    return {}, None
 
             except PermissionError:
                 raise
@@ -825,10 +758,6 @@ class WBApiClient:
         return {}, None
 
 
-
-
-
 def create_client(token: str) -> WBApiClient:
     """Фабрика для создания клиента"""
     return WBApiClient(token)
-

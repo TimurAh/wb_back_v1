@@ -109,25 +109,26 @@ def sync_user_reports(user_id: int, username: str, wb_token: str) -> TaskResult:
     total_inserted = 0
 
     try:
-        client = create_client(wb_token)
+        # ✅ ИЗМЕНЕНИЕ: Используем контекстный менеджер
+        with create_client(wb_token) as client:
+            # Получаем отчёты (API сам разбивает на интервалы)
+            reports = client.get_financial_reports(date_from, date_to, user_id=user_id)
 
-        # Получаем отчёты (API сам разбивает на интервалы)
-        reports = client.get_financial_reports(date_from, date_to, user_id=user_id)
+            if reports:
+                # Вставляем сразу, не храним в памяти
+                inserted = insert_financial_reports(user_id, reports)
+                total_inserted = inserted
 
-        if reports:
-            # Вставляем сразу, не храним в памяти
-            inserted = insert_financial_reports(user_id, reports)
-            total_inserted = inserted
+                logger.info(
+                    f"[{thread_name}] User {user_id}: ← Отчёты синхронизированы: {inserted}"
+                )
+            else:
+                logger.info(f"[{thread_name}] User {user_id}: нет данных отчётов")
 
-            logger.info(
-                f"[{thread_name}] User {user_id}: ← Отчёты синхронизированы: {inserted}"
-            )
-        else:
-            logger.info(f"[{thread_name}] User {user_id}: нет данных отчётов")
+            # ⚡ ЯВНАЯ ОЧИСТКА ПАМЯТИ
+            del reports
 
-        # ⚡ ЯВНАЯ ОЧИСТКА ПАМЯТИ
-        del reports
-        del client
+        # HTTP клиент автоматически закрыт здесь
         force_gc()
 
         return TaskResult(
@@ -171,55 +172,15 @@ def sync_user_funnel(user_id: int, username: str, wb_token: str) -> TaskResult:
     )
 
     try:
-        client = create_client(wb_token)
-        total_inserted = 0
-        requests_count = 0
+        # ✅ ИЗМЕНЕНИЕ: Используем контекстный менеджер
+        with create_client(wb_token) as client:
+            total_inserted = 0
+            requests_count = 0
 
-        if total_days == 1:
-            products = client.get_funnel_products(
-                selected_date=date_from,
-                past_date=date_from - timedelta(days=1),
-                user_id=user_id
-            )
-            requests_count += 1
-
-            if products:
-                inserted = insert_funnel_products(user_id, products, extract_both_periods=False)
-                total_inserted += inserted
-                # ⚡ Сразу освобождаем
-                del products
-        else:
-            current_date = date_from + timedelta(days=1)
-
-            while current_date <= date_to:
-                past_date = current_date - timedelta(days=1)
-
+            if total_days == 1:
                 products = client.get_funnel_products(
-                    selected_date=current_date,
-                    past_date=past_date,
-                    user_id=user_id
-                )
-                requests_count += 1
-
-                if products:
-                    # ⚡ STREAMING: вставляем сразу, не накапливаем
-                    inserted = insert_funnel_products(user_id, products, extract_both_periods=True)
-                    total_inserted += inserted
-                    # ⚡ Сразу освобождаем память
-                    del products
-
-                current_date += timedelta(days=2)
-
-                # ⚡ Периодическая сборка мусора (каждые 10 запросов)
-                if requests_count % 10 == 0:
-                    force_gc()
-
-            # Последняя дата
-            last_covered_selected = current_date - timedelta(days=2)
-            if last_covered_selected < date_to:
-                products = client.get_funnel_products(
-                    selected_date=date_to,
-                    past_date=date_to - timedelta(days=1),
+                    selected_date=date_from,
+                    past_date=date_from - timedelta(days=1),
                     user_id=user_id
                 )
                 requests_count += 1
@@ -227,15 +188,55 @@ def sync_user_funnel(user_id: int, username: str, wb_token: str) -> TaskResult:
                 if products:
                     inserted = insert_funnel_products(user_id, products, extract_both_periods=False)
                     total_inserted += inserted
+                    # ⚡ Сразу освобождаем
                     del products
+            else:
+                current_date = date_from + timedelta(days=1)
 
-        logger.info(
-            f"[{thread_name}] User {user_id}: ← Воронка синхронизирована: "
-            f"{total_inserted} (запросов: {requests_count})"
-        )
+                while current_date <= date_to:
+                    past_date = current_date - timedelta(days=1)
 
-        # ⚡ Финальная очистка
-        del client
+                    products = client.get_funnel_products(
+                        selected_date=current_date,
+                        past_date=past_date,
+                        user_id=user_id
+                    )
+                    requests_count += 1
+
+                    if products:
+                        # ⚡ STREAMING: вставляем сразу, не накапливаем
+                        inserted = insert_funnel_products(user_id, products, extract_both_periods=True)
+                        total_inserted += inserted
+                        # ⚡ Сразу освобождаем память
+                        del products
+
+                    current_date += timedelta(days=2)
+
+                    # ⚡ Периодическая сборка мусора (каждые 10 запросов)
+                    if requests_count % 10 == 0:
+                        force_gc()
+
+                # Последняя дата
+                last_covered_selected = current_date - timedelta(days=2)
+                if last_covered_selected < date_to:
+                    products = client.get_funnel_products(
+                        selected_date=date_to,
+                        past_date=date_to - timedelta(days=1),
+                        user_id=user_id
+                    )
+                    requests_count += 1
+
+                    if products:
+                        inserted = insert_funnel_products(user_id, products, extract_both_periods=False)
+                        total_inserted += inserted
+                        del products
+
+            logger.info(
+                f"[{thread_name}] User {user_id}: ← Воронка синхронизирована: "
+                f"{total_inserted} (запросов: {requests_count})"
+            )
+
+        # HTTP клиент автоматически закрыт здесь
         force_gc()
 
         return TaskResult(
@@ -293,44 +294,45 @@ def sync_user_advert_stats(user_id: int, username: str, wb_token: str) -> TaskRe
     )
 
     try:
-        client = create_client(wb_token)
+        # ✅ ИЗМЕНЕНИЕ: Используем контекстный менеджер
+        with create_client(wb_token) as client:
+            advert_ids = client.get_promotion_advert_ids(user_id=user_id)
 
-        advert_ids = client.get_promotion_advert_ids(user_id=user_id)
+            if not advert_ids:
+                logger.info(f"[{thread_name}] User {user_id}: нет рекламных кампаний")
+                # HTTP клиент автоматически закроется
+                return TaskResult(
+                    user_id=user_id,
+                    username=username,
+                    task_type=TaskType.ADVERT,
+                    success=True,
+                    records_count=0,
+                    no_access=False,
+                    error=None,
+                    duration_seconds=time.time() - start_time
+                )
 
-        if not advert_ids:
-            logger.info(f"[{thread_name}] User {user_id}: нет рекламных кампаний")
-            del client
-            return TaskResult(
-                user_id=user_id,
-                username=username,
-                task_type=TaskType.ADVERT,
-                success=True,
-                records_count=0,
-                no_access=False,
-                error=None,
-                duration_seconds=time.time() - start_time
+            stats = client.get_advert_fullstats(
+                advert_ids=advert_ids,
+                date_from=date_from,
+                date_to=date_to,
+                user_id=user_id
             )
 
-        stats = client.get_advert_fullstats(
-            advert_ids=advert_ids,
-            date_from=date_from,
-            date_to=date_to,
-            user_id=user_id
-        )
+            inserted = 0
+            if stats:
+                inserted = insert_advert_stats(user_id, stats)
+                logger.info(
+                    f"[{thread_name}] User {user_id}: ← Реклама синхронизирована: {inserted}"
+                )
+            else:
+                logger.info(f"[{thread_name}] User {user_id}: нет данных рекламы")
 
-        inserted = 0
-        if stats:
-            inserted = insert_advert_stats(user_id, stats)
-            logger.info(
-                f"[{thread_name}] User {user_id}: ← Реклама синхронизирована: {inserted}"
-            )
-        else:
-            logger.info(f"[{thread_name}] User {user_id}: нет данных рекламы")
+            # ⚡ ЯВНАЯ ОЧИСТКА
+            del stats
+            del advert_ids
 
-        # ⚡ ЯВНАЯ ОЧИСТКА
-        del stats
-        del advert_ids
-        del client
+        # HTTP клиент автоматически закрыт здесь
         force_gc()
 
         return TaskResult(
@@ -402,19 +404,21 @@ def sync_cost_price(user_id: int, username: str, wb_token: Optional[str] = None)
         photos_updated = 0
         if wb_token:
             try:
-                client = create_client(wb_token)
-                photos = client.get_cards_list(user_id=user_id)
+                # ✅ ИЗМЕНЕНИЕ: Используем контекстный менеджер
+                with create_client(wb_token) as client:
+                    photos = client.get_cards_list(user_id=user_id)
 
-                if photos:
-                    photos_updated = update_photos_in_cost_price(user_id, photos)
-                    logger.info(
-                        f"[{thread_name}] User {user_id}: "
-                        f"обновлено фото: {photos_updated}"
-                    )
+                    if photos:
+                        photos_updated = update_photos_in_cost_price(user_id, photos)
+                        logger.info(
+                            f"[{thread_name}] User {user_id}: "
+                            f"обновлено фото: {photos_updated}"
+                        )
 
-                # ⚡ ОЧИСТКА
-                del photos
-                del client
+                    # ⚡ ОЧИСТКА
+                    del photos
+
+                # HTTP клиент автоматически закрыт здесь
 
             except PermissionError:
                 logger.warning(
