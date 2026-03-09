@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS "user" (
     user_id SERIAL PRIMARY KEY,
     username VARCHAR(255),
     password VARCHAR(255),
-    wb_token VARCHAR(500),
+    wb_token VARCHAR(1000),
     subscription VARCHAR(50) NOT NULL DEFAULT 'free'
 );
 """
