@@ -1,44 +1,12 @@
 """
 Конфигурация приложения из переменных окружения
 """
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from enum import Enum
 from typing import Optional
 import os
 
-# ═══════════════════════════════════════════════════════════════
-# ОТЛАДКА — ДОБАВЬ ЭТО В НАЧАЛО
-# ═══════════════════════════════════════════════════════════════
-
-print("═" * 60)
-print("ОТЛАДКА ЗАГРУЗКИ КОНФИГУРАЦИИ")
-print("═" * 60)
-print(f"Текущая директория: {os.getcwd()}")
-print(f"Файлы .env в директории:")
-for f in ['.env', '.env.local', '.env.production']:
-    exists = os.path.exists(f)
-    print(f"  {f}: {'✓ найден' if exists else '✗ не найден'}")
-
-    # Если файл существует — покажем первые строки
-    if exists:
-        try:
-            with open(f, 'r', encoding='utf-8') as file:
-                lines = file.readlines()[:3]  # Первые 3 строки
-                for line in lines:
-                    # Скрываем значения (показываем только ключи)
-                    if '=' in line and not line.strip().startswith('#'):
-                        key = line.split('=')[0]
-                        print(f"    → {key}=***")
-        except Exception as e:
-            print(f"    Ошибка чтения файла: {e}")
-
-encryption_key_from_env = os.getenv('ENCRYPTION_KEY', 'НЕ УСТАНОВЛЕН')
-if encryption_key_from_env != 'НЕ УСТАНОВЛЕН':
-    print(f"ENCRYPTION_KEY из os.getenv: {encryption_key_from_env[:10]}...")
-else:
-    print(f"ENCRYPTION_KEY из os.getenv: НЕ УСТАНОВЛЕН")
-print("═" * 60)
 
 # ═══════════════════════════════════════════════════════════════
 # Enum для окружений
@@ -121,7 +89,6 @@ class Config(BaseSettings):
         description="Параллельная синхронизация задач пользователя"
     )
 
-    # ← ВАЖНО: Сделай поле необязательным с дефолтом для отладки
     ENCRYPTION_KEY: Optional[str] = Field(
         default=None,
         description="Ключ шифрования для токенов (Fernet)"
@@ -131,6 +98,59 @@ class Config(BaseSettings):
         default="INFO",
         description="Уровень логирования: DEBUG, INFO, WARNING, ERROR"
     )
+
+    PORT: int = Field(
+        default=8000,
+        ge=1,
+        le=65535,
+        description="Порт HTTP сервера"
+    )
+
+    CORS_ORIGINS: list[str] = Field(
+        default=["*"],
+        description="Разрешённые origins для CORS"
+    )
+
+    # ─────────────────────────────────────────────────────────
+    # Валидаторы
+    # ─────────────────────────────────────────────────────────
+
+    @field_validator('LOG_LEVEL')
+    @classmethod
+    def validate_log_level(cls, v: str) -> str:
+        """Проверка допустимых уровней логирования"""
+        allowed = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
+        v_upper = v.upper()
+        if v_upper not in allowed:
+            raise ValueError(f"LOG_LEVEL должен быть одним из: {allowed}")
+        return v_upper
+
+    @field_validator('WB_ENV', mode='before')
+    @classmethod
+    def validate_wb_env(cls, v) -> WBEnvironment:
+        """Преобразование строки в Enum"""
+        if isinstance(v, str):
+            return WBEnvironment(v.lower())
+        return v
+
+    @model_validator(mode='after')
+    def validate_worker_limits(self) -> 'Config':
+        """Кросс-валидация лимитов воркеров"""
+        if self.MAX_WORKERS_PER_TASK_TYPE > self.MAX_TOTAL_WORKERS:
+            raise ValueError(
+                f"MAX_WORKERS_PER_TASK_TYPE ({self.MAX_WORKERS_PER_TASK_TYPE}) "
+                f"не может быть > MAX_TOTAL_WORKERS ({self.MAX_TOTAL_WORKERS})"
+            )
+        if self.MAX_WORKERS_PER_USER > self.MAX_WORKERS_PER_TASK_TYPE:
+            raise ValueError(
+                f"MAX_WORKERS_PER_USER ({self.MAX_WORKERS_PER_USER}) "
+                f"не может быть > MAX_WORKERS_PER_TASK_TYPE ({self.MAX_WORKERS_PER_TASK_TYPE})"
+            )
+        return self
+
+    # ─────────────────────────────────────────────────────────
+    # Properties
+    # ─────────────────────────────────────────────────────────
 
     @property
     def WB_API_REPORT_URL(self) -> str:
@@ -151,24 +171,6 @@ class Config(BaseSettings):
         """URL для API рекламы"""
         return "https://advert-api.wildberries.ru"
 
-    @field_validator('LOG_LEVEL')
-    @classmethod
-    def validate_log_level(cls, v: str) -> str:
-        """Проверка допустимых уровней логирования"""
-        allowed = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
-        v_upper = v.upper()
-        if v_upper not in allowed:
-            raise ValueError(f"LOG_LEVEL должен быть одним из: {allowed}")
-        return v_upper
-
-    @field_validator('WB_ENV', mode='before')
-    @classmethod
-    def validate_wb_env(cls, v) -> WBEnvironment:
-        """Преобразование строки в Enum"""
-        if isinstance(v, str):
-            return WBEnvironment(v.lower())
-        return v
-
     model_config = SettingsConfigDict(
         env_file=('.env', '.env.production', '.env.local'),
         env_file_encoding='utf-8',
@@ -183,17 +185,48 @@ class Config(BaseSettings):
 
 config = Config()
 
-# ← ДОБАВЬ ОТЛАДКУ ПОСЛЕ СОЗДАНИЯ
-print("ПОСЛЕ СОЗДАНИЯ CONFIG:")
-if config.ENCRYPTION_KEY:
-    print(f"✅ config.ENCRYPTION_KEY загружен: {config.ENCRYPTION_KEY[:20]}...")
-else:
-    print("❌ config.ENCRYPTION_KEY = None (НЕ ЗАГРУЖЕН)")
-print("═" * 60)
+
+# ═══════════════════════════════════════════════════════════════
+# Отладка (только при LOG_LEVEL=DEBUG)
+# ═══════════════════════════════════════════════════════════════
+
+def _debug_env_loading():
+    """Выводит отладочную информацию о загрузке конфигурации"""
+    print("═" * 60)
+    print("ОТЛАДКА ЗАГРУЗКИ КОНФИГУРАЦИИ")
+    print("═" * 60)
+    print(f"Текущая директория: {os.getcwd()}")
+    print(f"Файлы .env в директории:")
+
+    for f in ['.env', '.env.local', '.env.production']:
+        exists = os.path.exists(f)
+        print(f"  {f}: {'✓ найден' if exists else '✗ не найден'}")
+
+        if exists:
+            try:
+                with open(f, 'r', encoding='utf-8') as file:
+                    lines = file.readlines()[:3]
+                    for line in lines:
+                        if '=' in line and not line.strip().startswith('#'):
+                            key = line.split('=')[0]
+                            print(f"    → {key}=***")
+            except Exception as e:
+                print(f"    Ошибка чтения файла: {e}")
+
+    if config.ENCRYPTION_KEY:
+        print(f"ENCRYPTION_KEY: {config.ENCRYPTION_KEY[:5]}...")
+    else:
+        print("ENCRYPTION_KEY: НЕ УСТАНОВЛЕН")
+    print("═" * 60)
+
+
+# Вызываем только при DEBUG
+if config.LOG_LEVEL == "DEBUG":
+    _debug_env_loading()
 
 
 # ═══════════════════════════════════════════════════════════════
-# Утилиты для отладки
+# Утилиты
 # ═══════════════════════════════════════════════════════════════
 
 def print_config() -> None:
@@ -218,38 +251,17 @@ def print_config() -> None:
 
     print("\n🔐 ШИФРОВАНИЕ:")
     if config.ENCRYPTION_KEY:
-        print(f"  ENCRYPTION_KEY: {config.ENCRYPTION_KEY[:20]}...")
+        print(f"  ENCRYPTION_KEY: {config.ENCRYPTION_KEY[:5]}...")
     else:
         print(f"  ENCRYPTION_KEY: ❌ НЕ УСТАНОВЛЕН")
 
     print("\n📋 LOGGING:")
     print(f"  Уровень: {config.LOG_LEVEL}")
+
+    print("\n🌐 SERVER:")
+    print(f"  Порт: {config.PORT}")
     print("=" * 60)
-
-
-def validate_config() -> bool:
-    """Проверяет корректность конфигурации"""
-    try:
-        if not config.DATABASE_URL.startswith('postgresql://'):
-            print("❌ DATABASE_URL должен начинаться с 'postgresql://'")
-            return False
-
-        if config.MAX_WORKERS_PER_TASK_TYPE > config.MAX_TOTAL_WORKERS:
-            print("❌ MAX_WORKERS_PER_TASK_TYPE не может быть больше MAX_TOTAL_WORKERS")
-            return False
-
-        if config.MAX_WORKERS_PER_USER > config.MAX_WORKERS_PER_TASK_TYPE:
-            print("❌ MAX_WORKERS_PER_USER не может быть больше MAX_WORKERS_PER_TASK_TYPE")
-            return False
-
-        print("✅ Конфигурация валидна")
-        return True
-
-    except Exception as e:
-        print(f"❌ Ошибка валидации конфигурации: {e}")
-        return False
 
 
 if __name__ == "__main__":
     print_config()
-    validate_config()

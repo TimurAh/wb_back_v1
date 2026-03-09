@@ -1,16 +1,14 @@
 """
 Задачи для выполнения по расписанию.
 
+ОПТИМИЗАЦИЯ ПАМЯТИ:
+- Streaming обработка (не накапливаем данные)
+- Явная очистка через del и gc.collect()
+- Ограниченный параллелизм
+
 ЛОГИКА СИНХРОНИЗАЦИИ:
 - Всегда перезагружаем ВЕСЬ период (DATA_RETENTION_MONTHS месяцев)
 - Используем UPSERT для обновления изменённых записей
-
-МНОГОПОТОЧНОСТЬ:
-- Каждая задача (отчёты/воронка/реклама) для каждого пользователя — отдельный поток
-- Ограничения настраиваются через config
-
-ПОРЯДОК ВЫПОЛНЕНИЯ:
-- COSTPRICE запускается сразу после успешного завершения REPORTS для каждого пользователя
 """
 from datetime import date, timedelta
 from typing import Optional, Dict, List, Set
@@ -19,6 +17,7 @@ from dataclasses import dataclass
 from enum import Enum
 import threading
 import time
+import gc
 
 
 from database import (
@@ -66,7 +65,7 @@ class SyncTask:
     """Описание задачи для выполнения"""
     user_id: int
     username: str
-    wb_token: Optional[str]  # Optional, т.к. COSTPRICE не требует токена
+    wb_token: Optional[str]
     task_type: TaskType
 
 
@@ -85,12 +84,20 @@ def calculate_full_period() -> tuple[date, date]:
     return date_from, date_to
 
 
+def force_gc():
+    """Принудительная сборка мусора"""
+    gc.collect()
+
+
 # ═══════════════════════════════════════════════════════════════
-# ФУНКЦИИ СИНХРОНИЗАЦИИ ДЛЯ КАЖДОГО ТИПА ЗАДАЧИ
+# ФУНКЦИИ СИНХРОНИЗАЦИИ — ОПТИМИЗИРОВАННЫЕ ПО ПАМЯТИ
 # ═══════════════════════════════════════════════════════════════
 
 def sync_user_reports(user_id: int, username: str, wb_token: str) -> TaskResult:
-    """Синхронизирует финансовые отчёты для одного пользователя."""
+    """
+    Синхронизирует финансовые отчёты для одного пользователя.
+    STREAMING: получаем данные порциями и сразу вставляем в БД.
+    """
     start_time = time.time()
     thread_name = threading.current_thread().name
     date_from, date_to = calculate_full_period()
@@ -99,35 +106,36 @@ def sync_user_reports(user_id: int, username: str, wb_token: str) -> TaskResult:
         f"[{thread_name}] User {user_id}: → Отчёты за {date_from} - {date_to}"
     )
 
+    total_inserted = 0
+
     try:
         client = create_client(wb_token)
+
+        # Получаем отчёты (API сам разбивает на интервалы)
         reports = client.get_financial_reports(date_from, date_to, user_id=user_id)
 
-        if not reports:
-            logger.info(f"[{thread_name}] User {user_id}: нет данных отчётов")
-            return TaskResult(
-                user_id=user_id,
-                username=username,
-                task_type=TaskType.REPORTS,
-                success=True,
-                records_count=0,
-                no_access=False,
-                error=None,
-                duration_seconds=time.time() - start_time
+        if reports:
+            # Вставляем сразу, не храним в памяти
+            inserted = insert_financial_reports(user_id, reports)
+            total_inserted = inserted
+
+            logger.info(
+                f"[{thread_name}] User {user_id}: ← Отчёты синхронизированы: {inserted}"
             )
+        else:
+            logger.info(f"[{thread_name}] User {user_id}: нет данных отчётов")
 
-        inserted = insert_financial_reports(user_id, reports)
-
-        logger.info(
-            f"[{thread_name}] User {user_id}: ← Отчёты синхронизированы: {inserted}"
-        )
+        # ⚡ ЯВНАЯ ОЧИСТКА ПАМЯТИ
+        del reports
+        del client
+        force_gc()
 
         return TaskResult(
             user_id=user_id,
             username=username,
             task_type=TaskType.REPORTS,
             success=True,
-            records_count=inserted,
+            records_count=total_inserted,
             no_access=False,
             error=None,
             duration_seconds=time.time() - start_time
@@ -135,6 +143,7 @@ def sync_user_reports(user_id: int, username: str, wb_token: str) -> TaskResult:
 
     except Exception as e:
         logger.error(f"[{thread_name}] User {user_id}: ошибка отчётов: {e}")
+        force_gc()
         return TaskResult(
             user_id=user_id,
             username=username,
@@ -148,7 +157,10 @@ def sync_user_reports(user_id: int, username: str, wb_token: str) -> TaskResult:
 
 
 def sync_user_funnel(user_id: int, username: str, wb_token: str) -> TaskResult:
-    """Синхронизирует воронку продаж для одного пользователя."""
+    """
+    Синхронизирует воронку продаж для одного пользователя.
+    STREAMING: каждую порцию сразу вставляем в БД, не накапливаем.
+    """
     start_time = time.time()
     thread_name = threading.current_thread().name
     date_from, date_to = calculate_full_period()
@@ -170,24 +182,39 @@ def sync_user_funnel(user_id: int, username: str, wb_token: str) -> TaskResult:
                 user_id=user_id
             )
             requests_count += 1
+
             if products:
                 inserted = insert_funnel_products(user_id, products, extract_both_periods=False)
                 total_inserted += inserted
+                # ⚡ Сразу освобождаем
+                del products
         else:
             current_date = date_from + timedelta(days=1)
+
             while current_date <= date_to:
                 past_date = current_date - timedelta(days=1)
+
                 products = client.get_funnel_products(
                     selected_date=current_date,
                     past_date=past_date,
                     user_id=user_id
                 )
                 requests_count += 1
+
                 if products:
+                    # ⚡ STREAMING: вставляем сразу, не накапливаем
                     inserted = insert_funnel_products(user_id, products, extract_both_periods=True)
                     total_inserted += inserted
+                    # ⚡ Сразу освобождаем память
+                    del products
+
                 current_date += timedelta(days=2)
 
+                # ⚡ Периодическая сборка мусора (каждые 10 запросов)
+                if requests_count % 10 == 0:
+                    force_gc()
+
+            # Последняя дата
             last_covered_selected = current_date - timedelta(days=2)
             if last_covered_selected < date_to:
                 products = client.get_funnel_products(
@@ -196,14 +223,20 @@ def sync_user_funnel(user_id: int, username: str, wb_token: str) -> TaskResult:
                     user_id=user_id
                 )
                 requests_count += 1
+
                 if products:
                     inserted = insert_funnel_products(user_id, products, extract_both_periods=False)
                     total_inserted += inserted
+                    del products
 
         logger.info(
             f"[{thread_name}] User {user_id}: ← Воронка синхронизирована: "
             f"{total_inserted} (запросов: {requests_count})"
         )
+
+        # ⚡ Финальная очистка
+        del client
+        force_gc()
 
         return TaskResult(
             user_id=user_id,
@@ -220,6 +253,7 @@ def sync_user_funnel(user_id: int, username: str, wb_token: str) -> TaskResult:
         logger.warning(
             f"[{thread_name}] User {user_id}: нет доступа к воронке (scope)"
         )
+        force_gc()
         return TaskResult(
             user_id=user_id,
             username=username,
@@ -233,6 +267,7 @@ def sync_user_funnel(user_id: int, username: str, wb_token: str) -> TaskResult:
 
     except Exception as e:
         logger.error(f"[{thread_name}] User {user_id}: ошибка воронки: {e}")
+        force_gc()
         return TaskResult(
             user_id=user_id,
             username=username,
@@ -246,7 +281,9 @@ def sync_user_funnel(user_id: int, username: str, wb_token: str) -> TaskResult:
 
 
 def sync_user_advert_stats(user_id: int, username: str, wb_token: str) -> TaskResult:
-    """Синхронизирует рекламную статистику для одного пользователя."""
+    """
+    Синхронизирует рекламную статистику для одного пользователя.
+    """
     start_time = time.time()
     thread_name = threading.current_thread().name
     date_from, date_to = calculate_full_period()
@@ -262,6 +299,7 @@ def sync_user_advert_stats(user_id: int, username: str, wb_token: str) -> TaskRe
 
         if not advert_ids:
             logger.info(f"[{thread_name}] User {user_id}: нет рекламных кампаний")
+            del client
             return TaskResult(
                 user_id=user_id,
                 username=username,
@@ -280,24 +318,20 @@ def sync_user_advert_stats(user_id: int, username: str, wb_token: str) -> TaskRe
             user_id=user_id
         )
 
-        if not stats:
-            logger.info(f"[{thread_name}] User {user_id}: нет данных рекламы")
-            return TaskResult(
-                user_id=user_id,
-                username=username,
-                task_type=TaskType.ADVERT,
-                success=True,
-                records_count=0,
-                no_access=False,
-                error=None,
-                duration_seconds=time.time() - start_time
+        inserted = 0
+        if stats:
+            inserted = insert_advert_stats(user_id, stats)
+            logger.info(
+                f"[{thread_name}] User {user_id}: ← Реклама синхронизирована: {inserted}"
             )
+        else:
+            logger.info(f"[{thread_name}] User {user_id}: нет данных рекламы")
 
-        inserted = insert_advert_stats(user_id, stats)
-
-        logger.info(
-            f"[{thread_name}] User {user_id}: ← Реклама синхронизирована: {inserted}"
-        )
+        # ⚡ ЯВНАЯ ОЧИСТКА
+        del stats
+        del advert_ids
+        del client
+        force_gc()
 
         return TaskResult(
             user_id=user_id,
@@ -314,6 +348,7 @@ def sync_user_advert_stats(user_id: int, username: str, wb_token: str) -> TaskRe
         logger.warning(
             f"[{thread_name}] User {user_id}: нет доступа к рекламному API"
         )
+        force_gc()
         return TaskResult(
             user_id=user_id,
             username=username,
@@ -327,6 +362,7 @@ def sync_user_advert_stats(user_id: int, username: str, wb_token: str) -> TaskRe
 
     except Exception as e:
         logger.error(f"[{thread_name}] User {user_id}: ошибка рекламы: {e}")
+        force_gc()
         return TaskResult(
             user_id=user_id,
             username=username,
@@ -341,15 +377,13 @@ def sync_user_advert_stats(user_id: int, username: str, wb_token: str) -> TaskRe
 
 def sync_cost_price(user_id: int, username: str, wb_token: Optional[str] = None) -> TaskResult:
     """
-    Синхронизирует таблицу себестоимости:
-    1. Загружает nm_id из financial_reports в cost_price
-    2. Получает фото карточек из WB Content API и обновляет url_photo
+    Синхронизирует таблицу себестоимости.
     """
     start_time = time.time()
     thread_name = threading.current_thread().name
 
     logger.info(
-        f"[{thread_name}] User {user_id}: → синхронизация себестоимости из репортов"
+        f"[{thread_name}] User {user_id}: → синхронизация себестоимости"
     )
 
     try:
@@ -377,19 +411,17 @@ def sync_cost_price(user_id: int, username: str, wb_token: Optional[str] = None)
                         f"[{thread_name}] User {user_id}: "
                         f"обновлено фото: {photos_updated}"
                     )
-                else:
-                    logger.info(
-                        f"[{thread_name}] User {user_id}: "
-                        f"нет карточек с фото в Content API"
-                    )
+
+                # ⚡ ОЧИСТКА
+                del photos
+                del client
 
             except PermissionError:
                 logger.warning(
                     f"[{thread_name}] User {user_id}: "
-                    f"нет доступа к Content API (scope), фото не обновлены"
+                    f"нет доступа к Content API, фото не обновлены"
                 )
             except Exception as e:
-                # Ошибка фото не должна ломать всю задачу
                 logger.error(
                     f"[{thread_name}] User {user_id}: "
                     f"ошибка получения фото: {e}"
@@ -397,10 +429,7 @@ def sync_cost_price(user_id: int, username: str, wb_token: Optional[str] = None)
 
         total_records = inserted_count + photos_updated
 
-        logger.info(
-            f"[{thread_name}] User {user_id}: ← Себестоимость синхронизирована: "
-            f"{inserted_count} новых nm_id, {photos_updated} фото обновлено"
-        )
+        force_gc()
 
         return TaskResult(
             user_id=user_id,
@@ -415,6 +444,7 @@ def sync_cost_price(user_id: int, username: str, wb_token: Optional[str] = None)
 
     except Exception as e:
         logger.error(f"[{thread_name}] User {user_id}: ошибка себестоимости: {e}")
+        force_gc()
         return TaskResult(
             user_id=user_id,
             username=username,
@@ -432,10 +462,7 @@ def sync_cost_price(user_id: int, username: str, wb_token: Optional[str] = None)
 # ═══════════════════════════════════════════════════════════════
 
 def execute_task(task: SyncTask) -> TaskResult:
-    """
-    Выполняет одну задачу синхронизации.
-    Роутер для разных типов задач.
-    """
+    """Выполняет одну задачу синхронизации."""
     if task.task_type == TaskType.REPORTS:
         return sync_user_reports(task.user_id, task.username, task.wb_token)
     elif task.task_type == TaskType.FUNNEL:
@@ -449,17 +476,17 @@ def execute_task(task: SyncTask) -> TaskResult:
 
 
 # ═══════════════════════════════════════════════════════════════
-# ГЛАВНАЯ ФУНКЦИЯ СИНХРОНИЗАЦИИ
+# ГЛАВНАЯ ФУНКЦИЯ — ОПТИМИЗИРОВАННАЯ ПО ПАМЯТИ
 # ═══════════════════════════════════════════════════════════════
 
 def sync_all_users() -> dict:
     """
     Основная задача: синхронизирует ВСЕ данные для всех пользователей.
 
-    Порядок выполнения:
-    - REPORTS, FUNNEL, ADVERT выполняются параллельно
-    - COSTPRICE запускается СРАЗУ после успешного завершения REPORTS
-      для конкретного пользователя (не дожидаясь FUNNEL/ADVERT)
+    ОПТИМИЗАЦИЯ ПАМЯТИ:
+    - Ограниченный параллелизм (меньше потоков = меньше памяти)
+    - Не храним все результаты — только статистику
+    - Принудительная сборка мусора после каждого пользователя
     """
     date_from, date_to = calculate_full_period()
     total_days = (date_to - date_from).days + 1
@@ -472,10 +499,9 @@ def sync_all_users() -> dict:
     logger.info("НАСТРОЙКИ МНОГОПОТОЧНОСТИ:")
     logger.info(f"  MAX_TOTAL_WORKERS: {config.MAX_TOTAL_WORKERS}")
     logger.info(f"  MAX_WORKERS_PER_TASK_TYPE: {config.MAX_WORKERS_PER_TASK_TYPE}")
-    logger.info(f"  PARALLEL_USER_TASKS: {config.PARALLEL_USER_TASKS}")
     logger.info("=" * 70)
 
-    # Статистика
+    # Статистика (только счётчики, не храним объекты)
     stats = {
         "users_total": 0,
         "users_success": 0,
@@ -484,7 +510,6 @@ def sync_all_users() -> dict:
         "tasks_total": 0,
         "tasks_success": 0,
         "tasks_failed": 0,
-        # По типам задач
         "reports_inserted": 0,
         "reports_no_access": 0,
         "funnel_inserted": 0,
@@ -492,11 +517,9 @@ def sync_all_users() -> dict:
         "advert_inserted": 0,
         "advert_no_access": 0,
         "costprice_inserted": 0,
-        # Очистка
         "reports_deleted": 0,
         "funnel_deleted": 0,
         "advert_deleted": 0,
-        # Время
         "total_duration_seconds": 0
     }
 
@@ -512,72 +535,64 @@ def sync_all_users() -> dict:
 
     logger.info(f"Найдено пользователей: {len(users)}")
 
-    # Маппинг user_id -> данные пользователя
-    user_map: Dict[int, dict] = {u["user_id"]: u for u in users}
+    # ⚡ ОПТИМИЗАЦИЯ: Уменьшаем параллелизм для экономии памяти
+    # На 1 GB RAM лучше не более 3-5 потоков
+    max_workers = min(config.MAX_TOTAL_WORKERS, 3)
+    logger.info(f"Используем {max_workers} потоков (оптимизация памяти)")
 
-    # ═══════════════════════════════════════════════════════════
-    # Создаём начальные задачи (REPORTS, FUNNEL, ADVERT)
-    # ═══════════════════════════════════════════════════════════
+    # Отслеживаем успешность по пользователям (только счётчики)
+    user_task_counts: Dict[int, Dict[str, int]] = {}
+    costprice_submitted: Set[int] = set()
+
+    # Создаём начальные задачи
     initial_tasks: List[SyncTask] = []
-
     for user in users:
+        user_id = user["user_id"]
+        user_task_counts[user_id] = {"total": 0, "success": 0}
+
         for task_type in [TaskType.REPORTS, TaskType.FUNNEL, TaskType.ADVERT]:
             initial_tasks.append(SyncTask(
-                user_id=user["user_id"],
+                user_id=user_id,
                 username=user["username"],
                 wb_token=user["wb_token"],
                 task_type=task_type
             ))
+            user_task_counts[user_id]["total"] += 1
 
-    logger.info(
-        f"Создано начальных задач: {len(initial_tasks)} "
-        f"({len(users)} пользователей × 3 типа)"
-    )
+    stats["tasks_total"] = len(initial_tasks)
+    logger.info(f"Создано задач: {len(initial_tasks)}")
 
-    # Результаты по пользователям
-    results_by_user: Dict[int, List[TaskResult]] = {}
+    # Маппинг user_id -> wb_token (для COSTPRICE)
+    user_tokens = {u["user_id"]: u for u in users}
 
-    # Отслеживаем, для каких пользователей уже запустили COSTPRICE
-    costprice_submitted: Set[int] = set()
-
-    # Счётчик задач (включая динамически добавленные COSTPRICE)
-    tasks_submitted = len(initial_tasks)
-    tasks_completed = 0
+    # ⚡ Освобождаем users — больше не нужен
+    del users
+    force_gc()
 
     with ThreadPoolExecutor(
-            max_workers=config.MAX_TOTAL_WORKERS,
-            thread_name_prefix="sync"
+        max_workers=max_workers,
+        thread_name_prefix="sync"
     ) as executor:
 
-        # Отправляем начальные задачи
         future_to_task: Dict[Future, SyncTask] = {
             executor.submit(execute_task, task): task
             for task in initial_tasks
         }
 
-        # Обрабатываем результаты по мере готовности
-        while future_to_task:
-            # Ждём завершения любой задачи
-            done_futures = set()
-            for future in as_completed(future_to_task):
-                done_futures.add(future)
-                break  # Обрабатываем по одной, чтобы сразу добавлять COSTPRICE
+        # ⚡ Освобождаем initial_tasks
+        del initial_tasks
 
-            for future in done_futures:
+        while future_to_task:
+            for future in as_completed(future_to_task):
                 task = future_to_task.pop(future)
-                tasks_completed += 1
 
                 try:
                     result = future.result()
 
-                    # Сохраняем результат
-                    if result.user_id not in results_by_user:
-                        results_by_user[result.user_id] = []
-                    results_by_user[result.user_id].append(result)
-
-                    # Обновляем статистику
+                    # Обновляем статистику (без хранения объектов)
                     if result.success:
                         stats["tasks_success"] += 1
+                        user_task_counts[result.user_id]["success"] += 1
                     else:
                         stats["tasks_failed"] += 1
 
@@ -587,13 +602,10 @@ def sync_all_users() -> dict:
                         if result.no_access:
                             stats["reports_no_access"] += 1
 
-                        # ═══════════════════════════════════════════════
-                        # КЛЮЧЕВАЯ ЛОГИКА: запускаем COSTPRICE сразу
-                        # после успешного завершения REPORTS
-                        # ═══════════════════════════════════════════════
+                        # Запускаем COSTPRICE после успешного REPORTS
                         if result.success and result.user_id not in costprice_submitted:
                             costprice_submitted.add(result.user_id)
-                            user_data = user_map[result.user_id]
+                            user_data = user_tokens[result.user_id]
 
                             costprice_task = SyncTask(
                                 user_id=result.user_id,
@@ -604,11 +616,8 @@ def sync_all_users() -> dict:
 
                             new_future = executor.submit(execute_task, costprice_task)
                             future_to_task[new_future] = costprice_task
-                            tasks_submitted += 1
-
-                            logger.debug(
-                                f"User {result.user_id}: COSTPRICE запущен после REPORTS"
-                            )
+                            stats["tasks_total"] += 1
+                            user_task_counts[result.user_id]["total"] += 1
 
                     elif result.task_type == TaskType.FUNNEL:
                         stats["funnel_inserted"] += result.records_count
@@ -623,42 +632,48 @@ def sync_all_users() -> dict:
                     elif result.task_type == TaskType.COSTPRICE:
                         stats["costprice_inserted"] += result.records_count
 
+                    # ⚡ Явно удаляем результат
+                    del result
+
                 except Exception as e:
                     stats["tasks_failed"] += 1
-                    logger.error(
-                        f"Task {task.task_type.value} for user {task.user_id}: "
-                        f"Ошибка получения результата: {e}"
-                    )
+                    logger.error(f"Task error: {e}")
 
-    stats["tasks_total"] = tasks_submitted
+                # ⚡ Сборка мусора после каждой задачи
+                force_gc()
 
-    # ═══════════════════════════════════════════════════════════
+                break  # Обрабатываем по одной
+
     # Анализируем результаты по пользователям
-    # ═══════════════════════════════════════════════════════════
-    for user_id, user_results in results_by_user.items():
-        success_count = sum(1 for r in user_results if r.success)
-        total_count = len(user_results)
-
-        if success_count == total_count:
+    for user_id, counts in user_task_counts.items():
+        if counts["success"] == counts["total"]:
             stats["users_success"] += 1
-        elif success_count > 0:
+        elif counts["success"] > 0:
             stats["users_partial"] += 1
         else:
             stats["users_failed"] += 1
 
-    # ═══════════════════════════════════════════════════════════
-    # Очистка устаревших данных
-    # ═══════════════════════════════════════════════════════════
+    # ⚡ Очищаем
+    del user_task_counts
+    del user_tokens
+    del costprice_submitted
+    force_gc()
+
+    # Очистка устаревших данных (последовательно для экономии памяти)
     logger.info("Очистка устаревших данных...")
+
     stats["reports_deleted"] = cleanup_old_reports()
+    force_gc()
+
     stats["funnel_deleted"] = cleanup_old_funnel_data()
+    force_gc()
+
     stats["advert_deleted"] = cleanup_old_advert_stats()
+    force_gc()
 
     stats["total_duration_seconds"] = round(time.time() - start_time, 2)
 
-    # ═══════════════════════════════════════════════════════════
     # Итоговый отчёт
-    # ═══════════════════════════════════════════════════════════
     logger.info("=" * 70)
     logger.info("СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА")
     logger.info("-" * 70)
@@ -666,8 +681,8 @@ def sync_all_users() -> dict:
     logger.info("-" * 70)
     logger.info("ПОЛЬЗОВАТЕЛИ:")
     logger.info(f"  Всего: {stats['users_total']}")
-    logger.info(f"  Успешно (все задачи): {stats['users_success']}")
-    logger.info(f"  Частично (часть задач): {stats['users_partial']}")
+    logger.info(f"  Успешно: {stats['users_success']}")
+    logger.info(f"  Частично: {stats['users_partial']}")
     logger.info(f"  С ошибками: {stats['users_failed']}")
     logger.info("-" * 70)
     logger.info("ЗАДАЧИ:")
@@ -675,21 +690,13 @@ def sync_all_users() -> dict:
     logger.info(f"  Успешно: {stats['tasks_success']}")
     logger.info(f"  С ошибками: {stats['tasks_failed']}")
     logger.info("-" * 70)
-    logger.info("ЗАПИСИ ВСТАВЛЕНО/ОБНОВЛЕНО:")
+    logger.info("ЗАПИСЕЙ:")
     logger.info(f"  Отчёты: {stats['reports_inserted']}")
     logger.info(f"  Воронка: {stats['funnel_inserted']}")
     logger.info(f"  Реклама: {stats['advert_inserted']}")
     logger.info(f"  Себестоимость: {stats['costprice_inserted']}")
     logger.info("-" * 70)
-    logger.info("БЕЗ ДОСТУПА (scope):")
-    if stats["reports_no_access"] > 0:
-        logger.info(f"  Отчёты: {stats['reports_no_access']}")
-    if stats["funnel_no_access"] > 0:
-        logger.info(f"  Воронка: {stats['funnel_no_access']}")
-    if stats["advert_no_access"] > 0:
-        logger.info(f"  Реклама: {stats['advert_no_access']}")
-    logger.info("-" * 70)
-    logger.info("УДАЛЕНО УСТАРЕВШИХ:")
+    logger.info("УДАЛЕНО:")
     logger.info(
         f"  Отчёты: {stats['reports_deleted']}, "
         f"Воронка: {stats['funnel_deleted']}, "
@@ -701,34 +708,44 @@ def sync_all_users() -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-# ОТДЕЛЬНЫЕ ФУНКЦИИ ДЛЯ РУЧНОГО ЗАПУСКА
+# УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ДЛЯ ОТДЕЛЬНЫХ ТИПОВ ЗАДАЧ
 # ═══════════════════════════════════════════════════════════════
 
-def sync_reports_only() -> dict:
-    """Синхронизирует только финансовые отчёты для всех пользователей."""
+def sync_single_task_type(task_type: TaskType) -> dict:
+    """Синхронизирует один тип задач для всех пользователей."""
     logger.info("=" * 70)
-    logger.info("ЗАПУСК СИНХРОНИЗАЦИИ: ТОЛЬКО ОТЧЁТЫ")
+    logger.info(f"ЗАПУСК: {task_type.value.upper()}")
     logger.info("=" * 70)
 
-    stats = {"users": 0, "success": 0, "failed": 0, "records": 0}
+    stats = {"users": 0, "success": 0, "failed": 0, "no_access": 0, "records": 0}
+
     users = get_users_with_tokens()
     stats["users"] = len(users)
+
+    if not users:
+        logger.warning("Нет пользователей")
+        return stats
 
     tasks = [
         SyncTask(
             user_id=u["user_id"],
             username=u["username"],
             wb_token=u["wb_token"],
-            task_type=TaskType.REPORTS
+            task_type=task_type
         )
         for u in users
     ]
 
-    with ThreadPoolExecutor(
-            max_workers=config.MAX_WORKERS_PER_TASK_TYPE,
-            thread_name_prefix="reports"
-    ) as executor:
+    del users
+    force_gc()
+
+    # ⚡ Ограниченный параллелизм
+    max_workers = min(config.MAX_WORKERS_PER_TASK_TYPE, 3)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(execute_task, t): t for t in tasks}
+
+        del tasks
 
         for future in as_completed(futures):
             try:
@@ -736,147 +753,43 @@ def sync_reports_only() -> dict:
                 if result.success:
                     stats["success"] += 1
                     stats["records"] += result.records_count
+                    if result.no_access:
+                        stats["no_access"] += 1
                 else:
                     stats["failed"] += 1
+                del result
             except Exception as e:
                 stats["failed"] += 1
                 logger.error(f"Ошибка: {e}")
 
-    cleanup_old_reports()
+            force_gc()
 
-    logger.info(f"ОТЧЁТЫ: {stats['records']} записей, {stats['success']}/{stats['users']} успешно")
+    # Cleanup
+    cleanup_map = {
+        TaskType.REPORTS: cleanup_old_reports,
+        TaskType.FUNNEL: cleanup_old_funnel_data,
+        TaskType.ADVERT: cleanup_old_advert_stats,
+    }
+
+    if task_type in cleanup_map:
+        cleanup_map[task_type]()
+        force_gc()
+
+    logger.info(f"{task_type.value.upper()}: {stats['records']} записей")
     return stats
+
+
+def sync_reports_only() -> dict:
+    return sync_single_task_type(TaskType.REPORTS)
 
 
 def sync_funnel_only() -> dict:
-    """Синхронизирует только воронку для всех пользователей."""
-    logger.info("=" * 70)
-    logger.info("ЗАПУСК СИНХРОНИЗАЦИИ: ТОЛЬКО ВОРОНКА")
-    logger.info("=" * 70)
-
-    stats = {"users": 0, "success": 0, "failed": 0, "no_access": 0, "records": 0}
-    users = get_users_with_tokens()
-    stats["users"] = len(users)
-
-    tasks = [
-        SyncTask(
-            user_id=u["user_id"],
-            username=u["username"],
-            wb_token=u["wb_token"],
-            task_type=TaskType.FUNNEL
-        )
-        for u in users
-    ]
-
-    with ThreadPoolExecutor(
-            max_workers=config.MAX_WORKERS_PER_TASK_TYPE,
-            thread_name_prefix="funnel"
-    ) as executor:
-        futures = {executor.submit(execute_task, t): t for t in tasks}
-
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                if result.success:
-                    stats["success"] += 1
-                    stats["records"] += result.records_count
-                    if result.no_access:
-                        stats["no_access"] += 1
-                else:
-                    stats['failed'] += 1
-            except Exception as e:
-                stats["failed"] += 1
-                logger.error(f"Ошибка: {e}")
-
-    cleanup_old_funnel_data()
-
-    logger.info(f"ВОРОНКА: {stats['records']} записей, {stats['success']}/{stats['users']} успешно")
-    return stats
+    return sync_single_task_type(TaskType.FUNNEL)
 
 
 def sync_advert_only() -> dict:
-    """Синхронизирует только рекламу для всех пользователей."""
-    logger.info("=" * 70)
-    logger.info("ЗАПУСК СИНХРОНИЗАЦИИ: ТОЛЬКО РЕКЛАМА")
-    logger.info("=" * 70)
-
-    stats = {"users": 0, "success": 0, "failed": 0, "no_access": 0, "records": 0}
-    users = get_users_with_tokens()
-    stats["users"] = len(users)
-
-    tasks = [
-        SyncTask(
-            user_id=u["user_id"],
-            username=u["username"],
-            wb_token=u["wb_token"],
-            task_type=TaskType.ADVERT
-        )
-        for u in users
-    ]
-
-    with ThreadPoolExecutor(
-            max_workers=config.MAX_WORKERS_PER_TASK_TYPE,
-            thread_name_prefix="advert"
-    ) as executor:
-        futures = {executor.submit(execute_task, t): t for t in tasks}
-
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                if result.success:
-                    stats["success"] += 1
-                    stats["records"] += result.records_count
-                    if result.no_access:
-                        stats["no_access"] += 1
-                else:
-                    stats["failed"] += 1
-            except Exception as e:
-                stats["failed"] += 1
-                logger.error(f"Ошибка: {e}")
-
-    cleanup_old_advert_stats()
-
-    logger.info(f"РЕКЛАМА: {stats['records']} записей, {stats['success']}/{stats['users']} успешно")
-    return stats
+    return sync_single_task_type(TaskType.ADVERT)
 
 
 def sync_costprice_only() -> dict:
-    """Синхронизирует только себестоимость для всех пользователей."""
-    logger.info("=" * 70)
-    logger.info("ЗАПУСК СИНХРОНИЗАЦИИ: ТОЛЬКО СЕБЕСТОИМОСТЬ")
-    logger.info("=" * 70)
-
-    stats = {"users": 0, "success": 0, "failed": 0, "records": 0}
-    users = get_users_with_tokens()
-    stats["users"] = len(users)
-
-    tasks = [
-        SyncTask(
-            user_id=u["user_id"],
-            username=u["username"],
-            wb_token=u["wb_token"],  # ← ИЗМЕНЕНО: было None
-            task_type=TaskType.COSTPRICE
-        )
-        for u in users
-    ]
-
-    with ThreadPoolExecutor(
-            max_workers=config.MAX_WORKERS_PER_TASK_TYPE,
-            thread_name_prefix="costprice"
-    ) as executor:
-        futures = {executor.submit(execute_task, t): t for t in tasks}
-
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                if result.success:
-                    stats["success"] += 1
-                    stats["records"] += result.records_count
-                else:
-                    stats["failed"] += 1
-            except Exception as e:
-                stats["failed"] += 1
-                logger.error(f"Ошибка: {e}")
-
-    logger.info(f"СЕБЕСТОИМОСТЬ: {stats['records']} записей, {stats['success']}/{stats['users']} успешно")
-    return stats
+    return sync_single_task_type(TaskType.COSTPRICE)
