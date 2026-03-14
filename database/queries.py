@@ -466,6 +466,7 @@ def get_detail_for_period_from_report(
         WHERE financial_reports.user_id = %s
           AND date_to::date >= %s::date
           AND date_to::date <= %s::date
+          AND financial_reports.nm_id > 0
         GROUP BY financial_reports.nm_id 
         ORDER BY financial_reports.nm_id ASC
     """
@@ -1332,21 +1333,31 @@ def get_advert_stats_for_user(user_id: int) -> Dict[str, Any]:
 def load_nm_from_financial_reports_in_cost_price(user_id: int) -> Dict[str, Any]:
     query = """
             INSERT INTO cost_price (nm_id, user_id, sa_name, url_photo)
-            SELECT DISTINCT \
-            ON (nm_id)
-                nm_id,
-                user_id,
-                sa_name,
-                'https://img.icons8.com/?size=100&id=118959&format=png&color=000000'
-            FROM financial_reports
-            WHERE user_id = %s
-              AND nm_id IS NOT NULL
-              AND nm_id != 0
-            ON CONFLICT (nm_id, user_id) DO NOTHING;
+            SELECT DISTINCT ON (nm_id) nm_id, \
+                                       user_id, \
+                                       sa_name, \
+                                       'https://img.icons8.com/?size=100&id=118959&format=png&color=000000'
+            FROM (
+                     -- nm_id из financial_reports
+                     SELECT nm_id, user_id, sa_name
+                     FROM financial_reports
+                     WHERE user_id = %s
+                       AND nm_id IS NOT NULL
+                       AND nm_id != 0
+
+                     UNION
+
+                     -- nm_id из funnel_product
+                     SELECT nm_id, user_id, vendor_code
+                     FROM funnel_product
+                     WHERE user_id = %s
+                       AND nm_id IS NOT NULL
+                       AND nm_id != 0) AS combined
+            ON CONFLICT (nm_id, user_id) DO NOTHING; \
             """
 
     with get_cursor(commit=True) as cursor:
-        cursor.execute(query, (user_id,))
+        cursor.execute(query, (user_id,user_id))
         # rowcount покажет количество реально ВСТАВЛЕННЫХ строк
         # (те, что попали в ON CONFLICT DO NOTHING, не учитываются)
         inserted_count = cursor.rowcount

@@ -512,7 +512,9 @@ async def get_dashboard_metrics(request: DateRangeRequest):
     Принимает:
     - primary: основной период {start, end}
     - compare: период сравнения (опционально)
-
+    - brand: список для фильтра брендов (опционально)
+    - category: список для фильтра категорий (опционально)
+    - sa_name: список для фильтра артиклов (опционально)
     Возвращает:
     - metrics: массив из 24 карточек показателей
     """
@@ -610,6 +612,17 @@ async def get_dashboard_metrics(request: DateRangeRequest):
     tags=["Dashboard"]
 )
 async def get_dashboard_dynamics(request: DateRangeRequest):
+    """
+        Принимает:
+        - primary: основной период {start, end}
+        - compare: период сравнения (опционально)
+        - brand: список для фильтра брендов (опционально)
+        - category: список для фильтра категорий (опционально)
+        - sa_name: список для фильтра артиклов (опционально)
+        Возвращает:
+        - compare_data: массив из 24 динамик за прошлый период
+        - primary_data: массив из 24 динамик за текущий период
+        """
     try:
         user_id = request.user_id
         if not user_id:
@@ -638,9 +651,20 @@ async def get_dashboard_dynamics(request: DateRangeRequest):
         )
 
         # ===== Период сравнения =====
-        compare_report = []
-        compare_funnel = []
-        compare_advert = []
+        compare_report = get_dynamic_for_period_from_report(
+            user_id=user_id,
+            date_from=request.compare.start,
+            date_to=request.compare.end,
+        )
+        compare_funnel = get_dynamic_for_period_from_funnel(
+            user_id=user_id,
+            date_from=request.compare.start,
+            date_to=request.compare.end, )
+        compare_advert = get_dynamic_for_period_from_advert_stats(
+            user_id=user_id,
+            date_from=request.compare.start,
+            date_to=request.compare.end,
+        )
 
         # ===== Формируем результат =====
 
@@ -691,7 +715,9 @@ async def get_dashboard_details(request: DateRangeRequest):
     Принимает:
     - primary: основной период {start, end}
     - compare: период сравнения (опционально)
-
+    - brand: список для фильтра брендов (опционально)
+    - category: список для фильтра категорий (опционально)
+    - sa_name: список для фильтра артиклов (опционально)
     Возвращает:
     - details: массив строк (один товар = одна строка с 24 MetricValue)
     """
