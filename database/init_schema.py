@@ -6,7 +6,7 @@ from .connection import get_cursor
 
 
 # ═══════════════════════════════════════════════════════════════
-# SQL для создания таблиц (разбитый на части)
+# SQL для создания таблиц
 # ═══════════════════════════════════════════════════════════════
 
 CREATE_USER_TABLE = """
@@ -181,8 +181,11 @@ CREATE INDEX IF NOT EXISTS idx_financial_reports_nm_id ON financial_reports (nm_
 CREATE INDEX IF NOT EXISTS idx_financial_reports_sale_dt ON financial_reports (sale_dt);
 """
 
-CREATE_VIEWS = """
--- View для дашборда (financial_reports + cost_price)
+# ═══════════════════════════════════════════════════════════════
+# SQL для создания VIEW
+# ═══════════════════════════════════════════════════════════════
+
+CREATE_VIEW_REPORT = """
 CREATE OR REPLACE VIEW v_report_dashboard AS
 SELECT
     fr.rrd_id,
@@ -216,6 +219,93 @@ LEFT JOIN cost_price cp
    AND cp.user_id = fr.user_id;
 """
 
+CREATE_VIEW_FUNNEL = """
+CREATE OR REPLACE VIEW v_funnel_dashboard AS
+SELECT
+    fp.id,
+    fp.user_id,
+    fp.nm_id,
+    fp.date_funnel,
+    fp.order_sum,
+    fp.order_count,
+    fp.open_count,
+    fp.cart_count,
+    fp.cancel_sum,
+    fp.cancel_count,
+    fp.stocks_wb,
+    fp.stocks_mp,
+    fp.stocks_wb + fp.stocks_mp AS stocks_balance,
+    fp.conversions_buyout_percent,
+    fp.vendor_code,
+    fp.brand_name,
+    cp.url_photo AS product_image_url,
+    cp.sa_name,
+    cp.c_price,
+    cp.fulfillment,
+    fr_category.subject_name AS category
+FROM funnel_product fp
+LEFT JOIN cost_price cp 
+    ON cp.nm_id = fp.nm_id 
+   AND cp.user_id = fp.user_id
+LEFT JOIN LATERAL (
+    SELECT DISTINCT ON (nm_id) subject_name
+    FROM financial_reports
+    WHERE nm_id = fp.nm_id 
+      AND user_id = fp.user_id
+      AND subject_name IS NOT NULL
+      AND subject_name != ''
+    ORDER BY nm_id, date_to DESC
+    LIMIT 1
+) fr_category ON true;
+"""
+
+CREATE_VIEW_ADVERT = """
+CREATE OR REPLACE VIEW v_advert_dashboard AS
+SELECT
+    ad.id,
+    ad.user_id,
+    ad.nm_id,
+    ad.date_stat,
+    ad.advert_id,
+    ad.app_type,
+    ad.sum AS ad_expense,
+    cp.url_photo AS product_image_url,
+    cp.sa_name,
+    cp.c_price,
+    cp.fulfillment,
+    fr_info.subject_name AS category,
+    fr_info.brand_name
+FROM advert_fullstats ad
+LEFT JOIN cost_price cp 
+    ON cp.nm_id = ad.nm_id 
+   AND cp.user_id = ad.user_id
+LEFT JOIN LATERAL (
+    SELECT DISTINCT ON (nm_id) subject_name, brand_name
+    FROM financial_reports
+    WHERE nm_id = ad.nm_id 
+      AND user_id = ad.user_id
+      AND (subject_name IS NOT NULL OR brand_name IS NOT NULL)
+    ORDER BY nm_id, date_to DESC
+    LIMIT 1
+) fr_info ON true;
+"""
+
+CREATE_VIEWS = f"""
+{CREATE_VIEW_REPORT}
+
+{CREATE_VIEW_FUNNEL}
+
+{CREATE_VIEW_ADVERT}
+"""
+
+# ═══════════════════════════════════════════════════════════════
+# Миграции
+# ═══════════════════════════════════════════════════════════════
+
+MIGRATIONS = """
+-- Пустые миграции (добавлять по необходимости)
+"""
+
 # Список всех SQL запросов для выполнения по порядку
 SQL_STATEMENTS = [
     ("user", CREATE_USER_TABLE),
@@ -223,8 +313,9 @@ SQL_STATEMENTS = [
     ("funnel_product", CREATE_FUNNEL_TABLE),
     ("advert_fullstats", CREATE_ADVERT_TABLE),
     ("cost_price", CREATE_COST_PRICE_TABLE),
-    ("views", CREATE_VIEWS),
     ("indexes", CREATE_INDEXES),
+    ("views", CREATE_VIEWS),
+    #("migrations", MIGRATIONS),
 ]
 
 

@@ -16,6 +16,7 @@ from models.costprices import CostPriceItem, CostPricesApiResponse
 from crypto import decrypt_token
 import json
 
+
 def get_users_with_tokens() -> List[Dict[str, Any]]:
     """
     Получает всех пользователей с валидными wb_token
@@ -31,17 +32,14 @@ def get_users_with_tokens() -> List[Dict[str, Any]]:
         cursor.execute(query)
         users = cursor.fetchall()
 
-        # Расшифровываем токены
         decrypted_users = []
         for user in users:
             user_dict = dict(user)
 
             try:
-                # Расшифровываем токен
                 user_dict['wb_token'] = decrypt_token(user_dict['wb_token'])
                 decrypted_users.append(user_dict)
             except Exception as e:
-                # Если токен не удалось расшифровать — пропускаем пользователя
                 logger.error(
                     f"Не удалось расшифровать токен для пользователя "
                     f"{user_dict['user_id']} ({user_dict['username']}): {e}"
@@ -55,9 +53,6 @@ def get_users_with_tokens() -> List[Dict[str, Any]]:
 def get_last_report_date(user_id: int) -> Optional[date]:
     """
     Получает дату последнего отчёта для пользователя.
-
-    ПРИМЕЧАНИЕ: Эта функция теперь используется только для информации.
-    Синхронизация всегда перезагружает весь период.
     """
     query = """
         SELECT MAX(date_to::date) as last_date
@@ -128,7 +123,7 @@ def get_users_load_info() -> List[Dict[str, Any]]:
 
 
 # ═══════════════════════════════════════════════════════════════
-# ЗАПРОСЫ ДЛЯ DASHBOARD
+# ЗАПРОСЫ ДЛЯ DASHBOARD (через VIEW)
 # ═══════════════════════════════════════════════════════════════
 
 def get_metrics_for_period_from_report(
@@ -137,186 +132,39 @@ def get_metrics_for_period_from_report(
     date_to: str
 ) -> Dict[str, Any]:
     """
-    Рассчитывает агрегированные метрики за период из financial_reports.
-    revenue - продажи руб. Напрямую идут в карточки
-    sales_count - продажи шт. Напрямую идут в карточки
-    returns_sum - возврат руб. Напрямую идут в карточки ( нет подтверждения, что это сумма корректна с количеством)
-    returns_quantity - возврат шт.Напрямую идут в карточки
-    cancels_sum - отмены руб.Напрямую идут в карточки
-    cancels_quantity - отмены шт.Напрямую идут в карточки
-    ppvz_for_pay - Перечисление продавцу. Используется для расчета чистой прибыли.
-    commission  -                                                                  неправильный расчет. Потом переделать
-    logistics - логистика. Напрямую идут в карточки и для расчета логистику за ед.
-    penalties - Штрафы. Напрямую идут в карточки
-    storage - Хранение. Используется для расчета чистой прибыли.
-    acceptance - Платная приемка. Используется для расчета чистой прибыли.
-    sum_cost_price - сумма себестоимости. Используется для расчета чистой прибыли и ROI.
-    sum_for_contribution - сумма для налога. Используется для расчета чистой прибыли.
-    deduction - Удержание без рекламы. Используется для расчета чистой прибыли.
+    Рассчитывает агрегированные метрики за период из v_report_dashboard.
     """
     query = """
         SELECT
             COALESCE(SUM(
-                CASE 
-                    WHEN doc_type_name = 'Продажа' 
-                        THEN retail_price * COALESCE(quantity, 1) 
-                    ELSE 0 
-                END
+                CASE WHEN doc_type_name = 'Продажа' 
+                    THEN retail_price * COALESCE(quantity, 1) ELSE 0 END
             ), 0) as revenue,
             COALESCE(SUM(
-                CASE 
-                    WHEN doc_type_name = 'Возврат' 
-                        THEN retail_price 
-                    ELSE 0 
-                END
-            ), 0) as returns_sum,
-            
-            COALESCE(SUM(
-                CASE 
-                    WHEN bonus_type_name = 'От клиента при возврате' 
-                        THEN COALESCE(return_amount, 1) 
-                    ELSE 0 
-                END
-            ), 0) as returns_quantity,
-            
-            COALESCE(SUM(
-                CASE 
-                    WHEN bonus_type_name = 'От клиента при отмене' 
-                        THEN ABS(retail_amount * COALESCE(return_amount, 1)) 
-                    ELSE 0 
-                END
-            ), 0) as cancels_sum,
-            COALESCE(SUM(
-                CASE 
-                    WHEN doc_type_name = 'Продажа' 
-                        THEN retail_amount * COALESCE(quantity, 1) 
-                    WHEN doc_type_name = 'Возврат' 
-                        THEN -retail_amount * COALESCE(quantity, 1) 
-                    ELSE 0 
-                END
-            ), 0) as sum_for_contribution,
-            COALESCE(SUM(
-                CASE 
-                    WHEN bonus_type_name = 'От клиента при отмене' 
-                        THEN COALESCE(return_amount, 1) 
-                    ELSE 0 
-                END
-            ), 0) as cancels_quantity,
-            COALESCE(SUM(CASE 
-                    WHEN doc_type_name = 'Продажа' 
-                        THEN ppvz_for_pay
-                    WHEN doc_type_name = 'Возврат' 
-                        THEN -ppvz_for_pay
-                    ELSE 0 
-                END), 0) as ppvz_for_pay,
-            COALESCE(AVG(NULLIF(commission_percent, 0)), 0) as commission,
-            COALESCE(SUM(delivery_rub), 0) as logistics,
-            COALESCE(SUM(penalty), 0) as penalties,
-            COALESCE(SUM(storage_fee), 0) as storage,
-            COALESCE(SUM(acceptance), 0) as acceptance,
-            COALESCE(SUM(
-                CASE 
-                    WHEN supplier_oper_name = 'Продажа' 
-                        THEN COALESCE(quantity, 1) 
-                    ELSE 0 
-                END
-            ), 0) as sales_count,
-            COALESCE(SUM(
-                CASE 
-                    WHEN doc_type_name = 'Продажа' 
-                        THEN COALESCE(quantity, 1) * (COALESCE(c_price,0) + COALESCE(fulfillment,0))
-                    WHEN doc_type_name = 'Возврат' 
-                        THEN COALESCE(quantity, 1) * (COALESCE(c_price,0) + COALESCE(fulfillment,0)) *-1
-                    ELSE 0 
-                END
-            ), 0) as sum_cost_price,
-            COALESCE(SUM(
-                CASE 
-                    WHEN supplier_oper_name = 'Удержание' and bonus_type_name NOT LIKE '%%WB Продвижение%%'
-                        THEN COALESCE(deduction, 0)
-                    ELSE 0 
-                END
-            ), 0) as deduction
-        FROM financial_reports
-            left join cost_price on cost_price.nm_id = financial_reports.nm_id
-        WHERE financial_reports.user_id = %s
-          AND date_to::date >= %s::date
-          AND date_to::date <= %s::date
-    """
-
-    with get_cursor() as cursor:
-        cursor.execute(query, (user_id, date_from, date_to))
-        result = cursor.fetchone()
-
-        if result:
-            return dict(result)
-
-        return {
-        }
-
-
-def get_dynamic_for_period_from_report(
-        user_id: int,
-        date_from: str,
-        date_to: str
-) -> List[Dict[str, Any]]:  # ← Изменить тип возврата
-    """
-    Рассчитывает данные для динамики за период из financial_reports.
-    """
-    query = """
-        SELECT 
-            COALESCE(SUM(
-                CASE 
-                    WHEN doc_type_name = 'Продажа' 
-                        THEN retail_price * COALESCE(quantity, 1) 
-                    ELSE 0 
-                END
-            ), 0) as revenue,
-            COALESCE(SUM(
-                CASE 
-                    WHEN doc_type_name = 'Возврат' 
-                        THEN retail_price 
-                    ELSE 0 
-                END
+                CASE WHEN doc_type_name = 'Возврат' 
+                    THEN retail_price ELSE 0 END
             ), 0) as returns_sum,
             COALESCE(SUM(
-                CASE 
-                    WHEN bonus_type_name = 'От клиента при возврате' 
-                        THEN COALESCE(return_amount, 1) 
-                    ELSE 0 
-                END
+                CASE WHEN bonus_type_name = 'От клиента при возврате' 
+                    THEN COALESCE(return_amount, 1) ELSE 0 END
             ), 0) as returns_quantity,
             COALESCE(SUM(
-                CASE 
-                    WHEN bonus_type_name = 'От клиента при отмене' 
-                        THEN ABS(retail_amount * COALESCE(return_amount, 1)) 
-                    ELSE 0 
-                END
+                CASE WHEN bonus_type_name = 'От клиента при отмене' 
+                    THEN ABS(retail_amount * COALESCE(return_amount, 1)) ELSE 0 END
             ), 0) as cancels_sum,
             COALESCE(SUM(
-                CASE 
-                    WHEN doc_type_name = 'Продажа' 
-                        THEN retail_amount * COALESCE(quantity, 1) 
-                    WHEN doc_type_name = 'Возврат' 
-                        THEN -retail_amount * COALESCE(quantity, 1) 
-                    ELSE 0 
-                END
+                CASE WHEN doc_type_name = 'Продажа' 
+                    THEN retail_amount * COALESCE(quantity, 1)
+                WHEN doc_type_name = 'Возврат' 
+                    THEN -retail_amount * COALESCE(quantity, 1) ELSE 0 END
             ), 0) as sum_for_contribution,
             COALESCE(SUM(
-                CASE 
-                    WHEN bonus_type_name = 'От клиента при отмене' 
-                        THEN COALESCE(return_amount, 1) 
-                    ELSE 0 
-                END
+                CASE WHEN bonus_type_name = 'От клиента при отмене' 
+                    THEN COALESCE(return_amount, 1) ELSE 0 END
             ), 0) as cancels_quantity,
             COALESCE(SUM(
-                CASE 
-                    WHEN doc_type_name = 'Продажа' 
-                        THEN ppvz_for_pay 
-                    WHEN doc_type_name = 'Возврат' 
-                        THEN -ppvz_for_pay 
-                    ELSE 0 
-                END
+                CASE WHEN doc_type_name = 'Продажа' THEN ppvz_for_pay
+                WHEN doc_type_name = 'Возврат' THEN -ppvz_for_pay ELSE 0 END
             ), 0) as ppvz_for_pay,
             COALESCE(AVG(NULLIF(commission_percent, 0)), 0) as commission,
             COALESCE(SUM(delivery_rub), 0) as logistics,
@@ -324,33 +172,95 @@ def get_dynamic_for_period_from_report(
             COALESCE(SUM(storage_fee), 0) as storage,
             COALESCE(SUM(acceptance), 0) as acceptance,
             COALESCE(SUM(
-                CASE 
-                    WHEN supplier_oper_name = 'Продажа' 
-                        THEN COALESCE(quantity, 1) 
-                    ELSE 0 
-                END
+                CASE WHEN supplier_oper_name = 'Продажа' 
+                    THEN COALESCE(quantity, 1) ELSE 0 END
             ), 0) as sales_count,
             COALESCE(SUM(
-                CASE 
-                    WHEN doc_type_name = 'Продажа' 
-                        THEN COALESCE(quantity, 1) * (COALESCE(c_price, 0) + COALESCE(fulfillment, 0)) 
-                    WHEN doc_type_name = 'Возврат' 
-                        THEN COALESCE(quantity, 1) * (COALESCE(c_price, 0) + COALESCE(fulfillment, 0)) * -1 
-                    ELSE 0 
-                END
+                CASE WHEN doc_type_name = 'Продажа' 
+                    THEN COALESCE(quantity, 1) * (c_price + fulfillment)
+                WHEN doc_type_name = 'Возврат' 
+                    THEN COALESCE(quantity, 1) * (c_price + fulfillment) * -1 ELSE 0 END
             ), 0) as sum_cost_price,
             COALESCE(SUM(
-                CASE 
-                    WHEN supplier_oper_name = 'Удержание' 
-                        AND bonus_type_name NOT LIKE '%%WB Продвижение%%' 
-                        THEN COALESCE(deduction, 0) 
-                    ELSE 0 
-                END
+                CASE WHEN supplier_oper_name = 'Удержание' 
+                    AND bonus_type_name NOT LIKE '%%WB Продвижение%%'
+                    THEN COALESCE(deduction, 0) ELSE 0 END
+            ), 0) as deduction
+        FROM v_report_dashboard
+        WHERE user_id = %s
+          AND date_to::date >= %s::date
+          AND date_to::date <= %s::date
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(query, (user_id, date_from, date_to))
+        result = cursor.fetchone()
+        return dict(result) if result else {}
+
+
+def get_dynamic_for_period_from_report(
+    user_id: int,
+    date_from: str,
+    date_to: str
+) -> List[Dict[str, Any]]:
+    """
+    Рассчитывает данные для динамики за период из v_report_dashboard.
+    """
+    query = """
+        SELECT 
+            COALESCE(SUM(
+                CASE WHEN doc_type_name = 'Продажа' 
+                    THEN retail_price * COALESCE(quantity, 1) ELSE 0 END
+            ), 0) as revenue,
+            COALESCE(SUM(
+                CASE WHEN doc_type_name = 'Возврат' 
+                    THEN retail_price ELSE 0 END
+            ), 0) as returns_sum,
+            COALESCE(SUM(
+                CASE WHEN bonus_type_name = 'От клиента при возврате' 
+                    THEN COALESCE(return_amount, 1) ELSE 0 END
+            ), 0) as returns_quantity,
+            COALESCE(SUM(
+                CASE WHEN bonus_type_name = 'От клиента при отмене' 
+                    THEN ABS(retail_amount * COALESCE(return_amount, 1)) ELSE 0 END
+            ), 0) as cancels_sum,
+            COALESCE(SUM(
+                CASE WHEN doc_type_name = 'Продажа' 
+                    THEN retail_amount * COALESCE(quantity, 1)
+                WHEN doc_type_name = 'Возврат' 
+                    THEN -retail_amount * COALESCE(quantity, 1) ELSE 0 END
+            ), 0) as sum_for_contribution,
+            COALESCE(SUM(
+                CASE WHEN bonus_type_name = 'От клиента при отмене' 
+                    THEN COALESCE(return_amount, 1) ELSE 0 END
+            ), 0) as cancels_quantity,
+            COALESCE(SUM(
+                CASE WHEN doc_type_name = 'Продажа' THEN ppvz_for_pay
+                WHEN doc_type_name = 'Возврат' THEN -ppvz_for_pay ELSE 0 END
+            ), 0) as ppvz_for_pay,
+            COALESCE(AVG(NULLIF(commission_percent, 0)), 0) as commission,
+            COALESCE(SUM(delivery_rub), 0) as logistics,
+            COALESCE(SUM(penalty), 0) as penalties,
+            COALESCE(SUM(storage_fee), 0) as storage,
+            COALESCE(SUM(acceptance), 0) as acceptance,
+            COALESCE(SUM(
+                CASE WHEN supplier_oper_name = 'Продажа' 
+                    THEN COALESCE(quantity, 1) ELSE 0 END
+            ), 0) as sales_count,
+            COALESCE(SUM(
+                CASE WHEN doc_type_name = 'Продажа' 
+                    THEN COALESCE(quantity, 1) * (c_price + fulfillment)
+                WHEN doc_type_name = 'Возврат' 
+                    THEN COALESCE(quantity, 1) * (c_price + fulfillment) * -1 ELSE 0 END
+            ), 0) as sum_cost_price,
+            COALESCE(SUM(
+                CASE WHEN supplier_oper_name = 'Удержание' 
+                    AND bonus_type_name NOT LIKE '%%WB Продвижение%%'
+                    THEN COALESCE(deduction, 0) ELSE 0 END
             ), 0) as deduction,
             date_to as date
-        FROM financial_reports
-        LEFT JOIN cost_price ON cost_price.nm_id = financial_reports.nm_id
-        WHERE financial_reports.user_id = %s
+        FROM v_report_dashboard
+        WHERE user_id = %s
           AND date_to::date >= %s::date
           AND date_to::date <= %s::date
         GROUP BY date_to 
@@ -360,74 +270,48 @@ def get_dynamic_for_period_from_report(
     with get_cursor() as cursor:
         cursor.execute(query, (user_id, date_from, date_to))
         result = cursor.fetchall()
+        return [dict(row) for row in result] if result else []
 
-        if result:
-            return [dict(row) for row in result]
-
-        return []
 
 def get_detail_for_period_from_report(
-        user_id: int,
-        date_from: str,
-        date_to: str
-) -> List[Dict[str, Any]]:  # ← Изменить тип возврата
+    user_id: int,
+    date_from: str,
+    date_to: str
+) -> List[Dict[str, Any]]:
     """
-    Рассчитывает данные детализации за период из financial_reports.
+    Рассчитывает данные детализации за период из v_report_dashboard.
     """
     query = """
         SELECT 
             COALESCE(SUM(
-                CASE 
-                    WHEN doc_type_name = 'Продажа' 
-                        THEN retail_price * COALESCE(quantity, 1) 
-                    ELSE 0 
-                END
+                CASE WHEN doc_type_name = 'Продажа' 
+                    THEN retail_price * COALESCE(quantity, 1) ELSE 0 END
             ), 0) as revenue,
             COALESCE(SUM(
-                CASE 
-                    WHEN doc_type_name = 'Возврат' 
-                        THEN retail_price 
-                    ELSE 0 
-                END
+                CASE WHEN doc_type_name = 'Возврат' 
+                    THEN retail_price ELSE 0 END
             ), 0) as returns_sum,
             COALESCE(SUM(
-                CASE 
-                    WHEN bonus_type_name = 'От клиента при возврате' 
-                        THEN COALESCE(return_amount, 1) 
-                    ELSE 0 
-                END
+                CASE WHEN bonus_type_name = 'От клиента при возврате' 
+                    THEN COALESCE(return_amount, 1) ELSE 0 END
             ), 0) as returns_quantity,
             COALESCE(SUM(
-                CASE 
-                    WHEN bonus_type_name = 'От клиента при отмене' 
-                        THEN ABS(retail_amount * COALESCE(return_amount, 1)) 
-                    ELSE 0 
-                END
+                CASE WHEN bonus_type_name = 'От клиента при отмене' 
+                    THEN ABS(retail_amount * COALESCE(return_amount, 1)) ELSE 0 END
             ), 0) as cancels_sum,
             COALESCE(SUM(
-                CASE 
-                    WHEN doc_type_name = 'Продажа' 
-                        THEN retail_amount * COALESCE(quantity, 1) 
-                    WHEN doc_type_name = 'Возврат' 
-                        THEN -retail_amount * COALESCE(quantity, 1) 
-                    ELSE 0 
-                END
+                CASE WHEN doc_type_name = 'Продажа' 
+                    THEN retail_amount * COALESCE(quantity, 1)
+                WHEN doc_type_name = 'Возврат' 
+                    THEN -retail_amount * COALESCE(quantity, 1) ELSE 0 END
             ), 0) as sum_for_contribution,
             COALESCE(SUM(
-                CASE 
-                    WHEN bonus_type_name = 'От клиента при отмене' 
-                        THEN COALESCE(return_amount, 1) 
-                    ELSE 0 
-                END
+                CASE WHEN bonus_type_name = 'От клиента при отмене' 
+                    THEN COALESCE(return_amount, 1) ELSE 0 END
             ), 0) as cancels_quantity,
             COALESCE(SUM(
-                CASE 
-                    WHEN doc_type_name = 'Продажа' 
-                        THEN ppvz_for_pay 
-                    WHEN doc_type_name = 'Возврат' 
-                        THEN -ppvz_for_pay 
-                    ELSE 0 
-                END
+                CASE WHEN doc_type_name = 'Продажа' THEN ppvz_for_pay
+                WHEN doc_type_name = 'Возврат' THEN -ppvz_for_pay ELSE 0 END
             ), 0) as ppvz_for_pay,
             COALESCE(AVG(NULLIF(commission_percent, 0)), 0) as commission,
             COALESCE(SUM(delivery_rub), 0) as logistics,
@@ -435,50 +319,132 @@ def get_detail_for_period_from_report(
             COALESCE(SUM(storage_fee), 0) as storage,
             COALESCE(SUM(acceptance), 0) as acceptance,
             COALESCE(SUM(
-                CASE 
-                    WHEN supplier_oper_name = 'Продажа' 
-                        THEN COALESCE(quantity, 1) 
-                    ELSE 0 
-                END
+                CASE WHEN supplier_oper_name = 'Продажа' 
+                    THEN COALESCE(quantity, 1) ELSE 0 END
             ), 0) as sales_count,
             COALESCE(SUM(
-                CASE 
-                    WHEN doc_type_name = 'Продажа' 
-                        THEN COALESCE(quantity, 1) * (COALESCE(c_price, 0) + COALESCE(fulfillment, 0)) 
-                    WHEN doc_type_name = 'Возврат' 
-                        THEN COALESCE(quantity, 1) * (COALESCE(c_price, 0) + COALESCE(fulfillment, 0)) * -1 
-                    ELSE 0 
-                END
+                CASE WHEN doc_type_name = 'Продажа' 
+                    THEN COALESCE(quantity, 1) * (c_price + fulfillment)
+                WHEN doc_type_name = 'Возврат' 
+                    THEN COALESCE(quantity, 1) * (c_price + fulfillment) * -1 ELSE 0 END
             ), 0) as sum_cost_price,
             COALESCE(SUM(
-                CASE 
-                    WHEN supplier_oper_name = 'Удержание' 
-                        AND bonus_type_name NOT LIKE '%%WB Продвижение%%' 
-                        THEN COALESCE(deduction, 0) 
-                    ELSE 0 
-                END
+                CASE WHEN supplier_oper_name = 'Удержание' 
+                    AND bonus_type_name NOT LIKE '%%WB Продвижение%%'
+                    THEN COALESCE(deduction, 0) ELSE 0 END
             ), 0) as deduction,
-            financial_reports.nm_id as nm_id,
-            MAX(cost_price.url_photo) as product_image_url,
-            MAX(cost_price.sa_name) as sa_name
-        FROM financial_reports
-        LEFT JOIN cost_price ON cost_price.nm_id = financial_reports.nm_id
-        WHERE financial_reports.user_id = %s
+            nm_id,
+            MAX(product_image_url) as product_image_url,
+            MAX(COALESCE(cp_sa_name, sa_name)) as sa_name
+        FROM v_report_dashboard
+        WHERE user_id = %s
           AND date_to::date >= %s::date
           AND date_to::date <= %s::date
-          AND financial_reports.nm_id > 0
-        GROUP BY financial_reports.nm_id 
-        ORDER BY financial_reports.nm_id ASC
+          AND nm_id > 0
+        GROUP BY nm_id 
+        ORDER BY nm_id ASC
     """
 
     with get_cursor() as cursor:
         cursor.execute(query, (user_id, date_from, date_to))
         result = cursor.fetchall()
+        return [dict(row) for row in result] if result else []
+
+
+def get_filters_for_user(user_id: int) -> Dict[str, Any]:
+    """
+    Получает уникальные значения для фильтров дашборда из v_report_dashboard.
+    """
+    query = """
+        SELECT
+            array_agg(DISTINCT sa_name) FILTER (WHERE sa_name IS NOT NULL AND sa_name != '') AS sa_name,
+            array_agg(DISTINCT brand_name) FILTER (WHERE brand_name IS NOT NULL AND brand_name != '') AS brends,
+            array_agg(DISTINCT subject_name) FILTER (WHERE subject_name IS NOT NULL AND subject_name != '') AS category
+        FROM v_report_dashboard
+        WHERE user_id = %s
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(query, (user_id,))
+        result = cursor.fetchone()
 
         if result:
-            return [dict(row) for row in result]
+            return {
+                "sa_name": result["sa_name"],
+                "brends": result["brends"],
+                "category": result["category"],
+            }
 
-        return []
+        return {
+            "sa_name": None,
+            "brends": None,
+            "category": None,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+# ЗАПРОСЫ ДЛЯ FUNNEL (через VIEW)
+# ═══════════════════════════════════════════════════════════════
+
+def get_metrics_for_period_from_funnel(
+    user_id: int,
+    date_from: str,
+    date_to: str
+) -> Dict[str, Any]:
+    """
+    Рассчитывает агрегированные метрики за период из v_funnel_dashboard.
+    """
+    query = """
+        WITH daily AS (
+            SELECT 
+                date_funnel,
+                SUM(order_sum) AS order_sum,
+                SUM(order_count) AS order_count,
+                SUM(stocks_balance) AS stocks_balance_sum,
+                SUM(open_count) AS open_count,
+                SUM(cart_count) AS cart_count,
+                SUM(cancel_sum) AS cancel_sum,
+                SUM(cancel_count) AS cancel_count,
+                AVG(NULLIF(conversions_buyout_percent, 0)) AS conversions_buyout_percent
+            FROM v_funnel_dashboard
+            WHERE user_id = %(user_id)s
+              AND date_funnel >= %(date_from)s::date
+              AND date_funnel <= %(date_to)s::date
+            GROUP BY date_funnel
+        )
+        SELECT 
+            COALESCE(SUM(order_sum), 0) AS order_sum,
+            COALESCE(SUM(order_count), 0) AS order_count,
+            (SELECT MAX(stocks_balance_sum) FROM daily) AS stocks_balance_sum,
+            COALESCE(SUM(open_count), 0) AS open_count,
+            COALESCE(SUM(cancel_sum), 0) AS cancel_sum,
+            COALESCE(SUM(cancel_count), 0) AS cancel_count,
+            CASE 
+                WHEN SUM(open_count) > 0 
+                THEN SUM(cart_count) * 100.0 / SUM(open_count) 
+                ELSE 0 
+            END AS conversions_add_to_cart_percent,
+            CASE 
+                WHEN SUM(cart_count) > 0 
+                THEN SUM(order_count) * 100.0 / SUM(cart_count) 
+                ELSE 0 
+            END AS conversions_cart_to_order_percent,
+            AVG(NULLIF(conversions_buyout_percent, 0)) AS conversions_buyout_percent
+        FROM v_funnel_dashboard
+        WHERE user_id = %(user_id)s
+          AND date_funnel >= %(date_from)s::date
+          AND date_funnel <= %(date_to)s::date
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(query, {
+            "user_id": user_id,
+            "date_from": date_from,
+            "date_to": date_to
+        })
+        result = cursor.fetchone()
+        return dict(result) if result else {}
+
 
 def get_dynamic_for_period_from_funnel(
     user_id: int,
@@ -486,35 +452,35 @@ def get_dynamic_for_period_from_funnel(
     date_to: str
 ) -> List[Dict[str, Any]]:
     """
-    Рассчитывает метрики из funnel_product с группировкой по дням.
+    Рассчитывает метрики из v_funnel_dashboard с группировкой по дням.
     """
     query = """
         SELECT 
-            fp.date_funnel                                AS date,
-            COALESCE(SUM(fp.order_sum), 0)                AS order_sum,
-            COALESCE(SUM(fp.order_count), 0)              AS order_count,
-            COALESCE(SUM(fp.stocks_wb + fp.stocks_mp), 0) AS stocks_balance_sum,
-            COALESCE(SUM(fp.open_count), 0)               AS open_count,
-            COALESCE(SUM(fp.cart_count), 0)                AS cart_count,
-            COALESCE(SUM(fp.cancel_sum), 0)               AS cancel_sum,
-            COALESCE(SUM(fp.cancel_count), 0)              AS cancel_count,
+            date_funnel AS date,
+            COALESCE(SUM(order_sum), 0) AS order_sum,
+            COALESCE(SUM(order_count), 0) AS order_count,
+            COALESCE(SUM(stocks_balance), 0) AS stocks_balance_sum,
+            COALESCE(SUM(open_count), 0) AS open_count,
+            COALESCE(SUM(cart_count), 0) AS cart_count,
+            COALESCE(SUM(cancel_sum), 0) AS cancel_sum,
+            COALESCE(SUM(cancel_count), 0) AS cancel_count,
             CASE 
-                WHEN SUM(fp.open_count) > 0 
-                THEN SUM(fp.cart_count) * 100.0 / SUM(fp.open_count) 
+                WHEN SUM(open_count) > 0 
+                THEN SUM(cart_count) * 100.0 / SUM(open_count) 
                 ELSE 0 
             END AS conversions_add_to_cart_percent,
             CASE 
-                WHEN SUM(fp.cart_count) > 0 
-                THEN SUM(fp.order_count) * 100.0 / SUM(fp.cart_count) 
+                WHEN SUM(cart_count) > 0 
+                THEN SUM(order_count) * 100.0 / SUM(cart_count) 
                 ELSE 0 
             END AS conversions_cart_to_order_percent,
-            AVG(NULLIF(fp.conversions_buyout_percent, 0)) AS conversions_buyout_percent
-        FROM funnel_product fp
-        WHERE fp.user_id = %(user_id)s
-          AND fp.date_funnel >= %(date_from)s::date
-          AND fp.date_funnel <= %(date_to)s::date
-        GROUP BY fp.date_funnel
-        ORDER BY fp.date_funnel
+            AVG(NULLIF(conversions_buyout_percent, 0)) AS conversions_buyout_percent
+        FROM v_funnel_dashboard
+        WHERE user_id = %(user_id)s
+          AND date_funnel >= %(date_from)s::date
+          AND date_funnel <= %(date_to)s::date
+        GROUP BY date_funnel
+        ORDER BY date_funnel
     """
 
     with get_cursor() as cursor:
@@ -524,11 +490,8 @@ def get_dynamic_for_period_from_funnel(
             "date_to": date_to
         })
         result = cursor.fetchall()
+        return [dict(row) for row in result] if result else []
 
-        if result:
-            return [dict(row) for row in result]
-
-        return []
 
 def get_detail_for_period_from_funnel(
     user_id: int,
@@ -536,39 +499,39 @@ def get_detail_for_period_from_funnel(
     date_to: str
 ) -> List[Dict[str, Any]]:
     """
-    Рассчитывает метрики из funnel_product с группировкой по дням.
+    Рассчитывает метрики из v_funnel_dashboard с группировкой по nm_id.
     """
     query = """
         SELECT 
-            fp.nm_id                                AS nm_id,
-            COALESCE(SUM(fp.order_sum), 0)                AS order_sum,
-            COALESCE(SUM(fp.order_count), 0)              AS order_count,
-            COALESCE(SUM(fp.stocks_wb + fp.stocks_mp), 0) AS stocks_balance_sum,
-            COALESCE(SUM(fp.open_count), 0)               AS open_count,
-            COALESCE(SUM(fp.cart_count), 0)                AS cart_count,
-            COALESCE(SUM(fp.cancel_sum), 0)               AS cancel_sum,
-            COALESCE(SUM(fp.cancel_count), 0)              AS cancel_count,
+            nm_id,
+            COALESCE(SUM(order_sum), 0) AS order_sum,
+            COALESCE(SUM(order_count), 0) AS order_count,
+            COALESCE(SUM(stocks_balance), 0) AS stocks_balance_sum,
+            COALESCE(SUM(open_count), 0) AS open_count,
+            COALESCE(SUM(cart_count), 0) AS cart_count,
+            COALESCE(SUM(cancel_sum), 0) AS cancel_sum,
+            COALESCE(SUM(cancel_count), 0) AS cancel_count,
             CASE 
-                WHEN SUM(fp.open_count) > 0 
-                THEN SUM(fp.cart_count) * 100.0 / SUM(fp.open_count) 
+                WHEN SUM(open_count) > 0 
+                THEN SUM(cart_count) * 100.0 / SUM(open_count) 
                 ELSE 0 
             END AS conversions_add_to_cart_percent,
             CASE 
-                WHEN SUM(fp.cart_count) > 0 
-                THEN SUM(fp.order_count) * 100.0 / SUM(fp.cart_count) 
+                WHEN SUM(cart_count) > 0 
+                THEN SUM(order_count) * 100.0 / SUM(cart_count) 
                 ELSE 0 
             END AS conversions_cart_to_order_percent,
-            AVG(NULLIF(fp.conversions_buyout_percent, 0)) AS conversions_buyout_percent,
-            Max(fp.vendor_code) as vendor_code,
-            Max(cost_price.url_photo) as product_image_url,
-            Max(cost_price.sa_name) as sa_name
-        FROM funnel_product fp
-            left join cost_price on cost_price.nm_id = fp.nm_id
-        WHERE fp.user_id = %(user_id)s
-          AND fp.date_funnel >= %(date_from)s::date
-          AND fp.date_funnel <= %(date_to)s::date
-        GROUP BY fp.nm_id
-        ORDER BY fp.nm_id
+            AVG(NULLIF(conversions_buyout_percent, 0)) AS conversions_buyout_percent,
+            MAX(vendor_code) AS vendor_code,
+            MAX(product_image_url) AS product_image_url,
+            MAX(sa_name) AS sa_name,
+            MAX(category) AS category
+        FROM v_funnel_dashboard
+        WHERE user_id = %(user_id)s
+          AND date_funnel >= %(date_from)s::date
+          AND date_funnel <= %(date_to)s::date
+        GROUP BY nm_id
+        ORDER BY nm_id
     """
 
     with get_cursor() as cursor:
@@ -578,12 +541,12 @@ def get_detail_for_period_from_funnel(
             "date_to": date_to
         })
         result = cursor.fetchall()
+        return [dict(row) for row in result] if result else []
 
-        if result:
-            return [dict(row) for row in result]
 
-        return []
-
+# ═══════════════════════════════════════════════════════════════
+# ЗАПРОСЫ ДЛЯ ADVERT (через VIEW)
+# ═══════════════════════════════════════════════════════════════
 
 def get_metrics_for_period_from_advert_stats(
     user_id: int,
@@ -591,50 +554,44 @@ def get_metrics_for_period_from_advert_stats(
     date_to: str
 ) -> Dict[str, Any]:
     """
-    Рассчитывает агрегированные метрики за период из advert_stats.
+    Рассчитывает агрегированные метрики за период из v_advert_dashboard.
     """
     query = """
         SELECT 
-             SUM(sum) as ad_expense
-            FROM advert_fullstats
-            WHERE user_id = %(user_id)s
-              AND date_stat >= %(date_from)s::date
-              AND date_stat <= %(date_to)s::date
+            COALESCE(SUM(ad_expense), 0) AS ad_expense
+        FROM v_advert_dashboard
+        WHERE user_id = %(user_id)s
+          AND date_stat >= %(date_from)s::date
+          AND date_stat <= %(date_to)s::date
     """
 
     with get_cursor() as cursor:
         cursor.execute(query, {
-            "user_id":user_id,
-            "date_from":date_from,
-            "date_to":date_to
+            "user_id": user_id,
+            "date_from": date_from,
+            "date_to": date_to
         })
         result = cursor.fetchone()
-
-        if result:
-            return dict(result)
-
-        return {
-            'ad_expense': 0
-        }
+        return dict(result) if result else {"ad_expense": 0}
 
 
 def get_dynamic_for_period_from_advert_stats(
     user_id: int,
     date_from: str,
     date_to: str
-) -> List[Dict[str, Any]]:  # ← Тип возврата
+) -> List[Dict[str, Any]]:
     """
-    Рассчитывает данные для динамики за период из advert_stats.
+    Рассчитывает данные для динамики за период из v_advert_dashboard.
     """
     query = """
         SELECT 
-            SUM(sum) as ad_expense,
-            date_stat as date
-        FROM advert_fullstats
+            date_stat AS date,
+            COALESCE(SUM(ad_expense), 0) AS ad_expense
+        FROM v_advert_dashboard
         WHERE user_id = %(user_id)s
           AND date_stat >= %(date_from)s::date
           AND date_stat <= %(date_to)s::date
-        GROUP BY date_stat 
+        GROUP BY date_stat
         ORDER BY date_stat ASC
     """
 
@@ -645,30 +602,30 @@ def get_dynamic_for_period_from_advert_stats(
             "date_to": date_to
         })
         result = cursor.fetchall()
-
-        if result:
-            return [dict(row) for row in result]
-
-        return []
+        return [dict(row) for row in result] if result else []
 
 
 def get_detail_for_period_from_advert_stats(
     user_id: int,
     date_from: str,
     date_to: str
-) -> List[Dict[str, Any]]:  # ← Тип возврата
+) -> List[Dict[str, Any]]:
     """
-    Рассчитывает данные детализации за период из advert_stats.
+    Рассчитывает данные детализации за период из v_advert_dashboard.
     """
     query = """
         SELECT 
-            SUM(sum) as ad_expense,
-            nm_id as nm_id
-        FROM advert_fullstats
+            nm_id,
+            COALESCE(SUM(ad_expense), 0) AS ad_expense,
+            MAX(product_image_url) AS product_image_url,
+            MAX(sa_name) AS sa_name,
+            MAX(category) AS category,
+            MAX(brand_name) AS brand_name
+        FROM v_advert_dashboard
         WHERE user_id = %(user_id)s
           AND date_stat >= %(date_from)s::date
           AND date_stat <= %(date_to)s::date
-        GROUP BY nm_id 
+        GROUP BY nm_id
         ORDER BY nm_id ASC
     """
 
@@ -679,76 +636,8 @@ def get_detail_for_period_from_advert_stats(
             "date_to": date_to
         })
         result = cursor.fetchall()
+        return [dict(row) for row in result] if result else []
 
-        if result:
-            return [dict(row) for row in result]
-
-        return []
-
-def get_metrics_for_period_from_funnel(
-    user_id: int,
-    date_from: str,
-    date_to: str
-) -> Dict[str, Any]:
-    """
-    Рассчитывает агрегированные метрики за период из funnel_product.
-    """
-    query = """
-        WITH daily AS (
-            SELECT 
-                date_funnel,
-                SUM(order_sum)                             AS order_sum,
-                SUM(order_count)                           AS order_count,
-                SUM(stocks_wb + stocks_mp)                 AS stocks_balance_sum,
-                SUM(open_count)                            AS open_count,
-                SUM(cart_count)                             AS cart_count,
-                SUM(cancel_sum)                            AS cancel_sum,
-                SUM(cancel_count)                          AS cancel_count,
-                AVG(NULLIF(conversions_buyout_percent, 0)) AS conversions_buyout_percent
-            FROM funnel_product
-            WHERE user_id = %(user_id)s
-              AND date_funnel >= %(date_from)s::date
-              AND date_funnel <= %(date_to)s::date
-            GROUP BY date_funnel
-        )
-        SELECT 
-            COALESCE(SUM(fp.order_sum), 0)       AS order_sum,
-            COALESCE(SUM(fp.order_count), 0)     AS order_count,
-            (Select Max(stocks_balance_sum) from daily) AS stocks_balance_sum,
-            COALESCE(SUM(fp.open_count), 0)      AS open_count,
-            COALESCE(SUM(fp.cancel_sum), 0)      AS cancel_sum,
-            COALESCE(SUM(fp.cancel_count), 0)    AS cancel_count,
-            CASE 
-                WHEN SUM(fp.open_count) > 0 
-                THEN SUM(fp.cart_count) * 100.0 / SUM(fp.open_count) 
-                ELSE 0 
-            END AS conversions_add_to_cart_percent,
-            CASE 
-                WHEN SUM(fp.cart_count) > 0 
-                THEN SUM(fp.order_count) * 100.0 / SUM(fp.cart_count) 
-                ELSE 0 
-            END AS conversions_cart_to_order_percent,
-            AVG(NULLIF(fp.conversions_buyout_percent, 0)) AS conversions_buyout_percent
-        FROM funnel_product fp
-            WHERE fp.user_id = %(user_id)s
-              AND fp.date_funnel >= %(date_from)s::date
-              AND fp.date_funnel <= %(date_to)s::date
-    """
-
-    with get_cursor() as cursor:
-        cursor.execute(query, {
-            "user_id":user_id,
-            "date_from":date_from,
-            "date_to":date_to
-        })
-        result = cursor.fetchone()
-
-        if result:
-            return dict(result)
-
-        return {
-
-        }
 
 def get_details_by_product(
     user_id: int,
@@ -767,7 +656,7 @@ def get_details_by_product(
             COALESCE(SUM(
                 CASE 
                     WHEN supplier_oper_name = 'Продажа' 
-                        THEN retail_price_withdisc_rub * COALESCE(quantity, 1) 
+                        THEN retail_price * COALESCE(quantity, 1) 
                     ELSE 0 
                 END
             ), 0) as sales_rub,
@@ -793,7 +682,7 @@ def get_details_by_product(
                     ELSE 0 
                 END
             ), 0) as returns_count
-        FROM financial_reports
+        FROM v_report_dashboard
         WHERE user_id = %s
           AND date_to::date >= %s::date
           AND date_to::date <= %s::date
@@ -861,8 +750,6 @@ def get_details_by_product(
 def insert_financial_reports(user_id: int, reports: List[Dict[str, Any]]) -> int:
     """
     Вставляет или обновляет финансовые отчёты в БД.
-
-    ЛОГИКА: UPSERT по rrd_id с BATCH обработкой для экономии памяти.
     """
     if not reports:
         return 0
@@ -877,7 +764,6 @@ def insert_financial_reports(user_id: int, reports: List[Dict[str, Any]]) -> int
         f"User {user_id}: валидировано {len(validated_reports)} из {len(reports)} записей"
     )
 
-    # ⚡ Освобождаем оригинальные данные
     del reports
 
     fields = [
@@ -923,7 +809,6 @@ def insert_financial_reports(user_id: int, reports: List[Dict[str, Any]]) -> int
             values.append(value)
         return tuple(values)
 
-    # ⚡ BATCH ОБРАБОТКА — не держим всё в памяти
     BATCH_SIZE = 5000
     total_affected = 0
     skipped_total = 0
@@ -932,11 +817,9 @@ def insert_financial_reports(user_id: int, reports: List[Dict[str, Any]]) -> int
         for i in range(0, len(validated_reports), BATCH_SIZE):
             batch = validated_reports[i:i + BATCH_SIZE]
 
-            # Конвертируем батч
             db_rows = [report.to_db_dict(user_id) for report in batch]
             values = [prepare_row(row) for row in db_rows]
 
-            # Фильтруем без rrd_id
             valid_values = [v for v in values if v[0] is not None]
             skipped_total += len(values) - len(valid_values)
 
@@ -948,10 +831,8 @@ def insert_financial_reports(user_id: int, reports: List[Dict[str, Any]]) -> int
                     logger.error(f"User {user_id}: ошибка batch {i // BATCH_SIZE + 1}: {e}")
                     raise
 
-            # ⚡ Освобождаем память батча
             del batch, db_rows, values, valid_values
 
-        # ⚡ Освобождаем validated_reports после цикла
         del validated_reports
 
     if skipped_total > 0:
@@ -959,7 +840,6 @@ def insert_financial_reports(user_id: int, reports: List[Dict[str, Any]]) -> int
 
     logger.info(f"User {user_id}: отчёты — вставлено/обновлено {total_affected} записей")
     return total_affected
-
 
 
 def cleanup_old_reports(months: int = None) -> int:
@@ -995,9 +875,6 @@ def cleanup_old_reports(months: int = None) -> int:
 def get_last_funnel_date(user_id: int) -> Optional[date]:
     """
     Получает дату последней записи воронки для пользователя.
-
-    ПРИМЕЧАНИЕ: Эта функция теперь используется только для информации.
-    Синхронизация всегда перезагружает весь период.
     """
     query = """
         SELECT MAX(date_funnel) as last_date
@@ -1024,8 +901,6 @@ def insert_funnel_products(
 ) -> int:
     """
     Вставляет или обновляет данные воронки продаж в БД.
-
-    ЛОГИКА: UPSERT по (user_id, nm_id, date_funnel) с BATCH обработкой.
     """
     from models.funnel_product import (
         validate_funnel_products,
@@ -1035,7 +910,6 @@ def insert_funnel_products(
     if not products:
         return 0
 
-    # ===== ШАГ 1: Валидация =====
     if extract_both_periods:
         validated_products = extract_both(products)
         logger.info(
@@ -1053,10 +927,8 @@ def insert_funnel_products(
         logger.warning(f"User {user_id}: все записи воронки отклонены при валидации")
         return 0
 
-    # ⚡ Освобождаем оригинальные данные
     del products
 
-    # ===== ШАГ 2: Формируем список полей =====
     fields = [
         "user_id", "nm_id", "vendor_code", "brand_name",
         "stocks_wb", "stocks_mp", "stocks_balance_sum",
@@ -1082,7 +954,6 @@ def insert_funnel_products(
     def prepare_row(row_dict: dict) -> tuple:
         return tuple(row_dict.get(field) for field in fields)
 
-    # ⚡ BATCH ОБРАБОТКА
     BATCH_SIZE = 5000
     total_affected = 0
 
@@ -1090,7 +961,6 @@ def insert_funnel_products(
         for i in range(0, len(validated_products), BATCH_SIZE):
             batch = validated_products[i:i + BATCH_SIZE]
 
-            # Конвертируем батч
             db_rows = [product.to_db_dict(user_id) for product in batch]
             values = [prepare_row(row) for row in db_rows]
 
@@ -1102,10 +972,8 @@ def insert_funnel_products(
                     logger.error(f"User {user_id}: ошибка batch воронки {i // BATCH_SIZE + 1}: {e}")
                     raise
 
-            # ⚡ Освобождаем память батча
             del batch, db_rows, values
 
-        # ⚡ Освобождаем validated_products после цикла
         del validated_products
 
     logger.info(f"User {user_id}: воронка — вставлено/обновлено {total_affected} записей")
@@ -1186,35 +1054,21 @@ def get_funnel_stats_for_user(user_id: int) -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════
 
 def insert_advert_stats(
-        user_id: int,
-        stats: List[Any]  # List[AdvertStatsRow]
+    user_id: int,
+    stats: List[Any]
 ) -> int:
     """
     Вставляет или обновляет статистику рекламных кампаний.
-
-    ЛОГИКА: UPSERT по (user_id, advert_id, date_stat, app_type, nm_id)
-    - Если запись существует — обновляем sum
-    - Если нет — вставляем новую
-
-    Args:
-        user_id: ID пользователя
-        stats: Список AdvertStatsRow из парсинга API
-
-    Returns:
-        Количество вставленных/обновлённых записей
     """
     if not stats:
         return 0
 
-    # Преобразуем в словари для БД
     db_rows = [stat.to_db_dict(user_id) for stat in stats]
 
-    # Поля для вставки
     fields = [
         "user_id", "advert_id", "date_stat", "app_type", "nm_id", "sum"
     ]
 
-    # Подготовка значений
     def prepare_row(row_dict: dict) -> tuple:
         return tuple(row_dict.get(field) for field in fields)
 
@@ -1222,7 +1076,6 @@ def insert_advert_stats(
 
     fields_str = ", ".join(fields)
 
-    # При конфликте обновляем sum и updated_at
     query = f"""
         INSERT INTO advert_fullstats ({fields_str}, updated_at)
         VALUES %s
@@ -1232,7 +1085,6 @@ def insert_advert_stats(
             updated_at = NOW()
     """
 
-    # Добавляем updated_at к значениям
     values_with_timestamp = [v + (datetime.now(),) for v in values]
 
     with get_cursor(commit=True) as cursor:
@@ -1264,10 +1116,9 @@ def cleanup_old_advert_stats(months: int = None) -> int:
     cutoff_date = date.today() - timedelta(days=months * 30)
 
     query = """
-            DELETE \
-            FROM advert_fullstats
-            WHERE date_stat < %s \
-            """
+        DELETE FROM advert_fullstats
+        WHERE date_stat < %s
+    """
 
     with get_cursor(commit=True) as cursor:
         cursor.execute(query, (cutoff_date,))
@@ -1287,16 +1138,17 @@ def get_advert_stats_for_user(user_id: int) -> Dict[str, Any]:
     Возвращает статистику по рекламе для пользователя.
     """
     query = """
-            SELECT COUNT(*)                  as total_records, \
-                   COUNT(DISTINCT advert_id) as unique_adverts, \
-                   COUNT(DISTINCT nm_id)     as unique_products, \
-                   MIN(date_stat)            as first_date, \
-                   MAX(date_stat)            as last_date, \
-                   COUNT(DISTINCT date_stat) as days_count, \
-                   COALESCE(SUM(sum), 0)     as total_sum
-            FROM advert_fullstats
-            WHERE user_id = %s \
-            """
+        SELECT 
+            COUNT(*) as total_records,
+            COUNT(DISTINCT advert_id) as unique_adverts,
+            COUNT(DISTINCT nm_id) as unique_products,
+            MIN(date_stat) as first_date,
+            MAX(date_stat) as last_date,
+            COUNT(DISTINCT date_stat) as days_count,
+            COALESCE(SUM(sum), 0) as total_sum
+        FROM advert_fullstats
+        WHERE user_id = %s
+    """
 
     with get_cursor() as cursor:
         cursor.execute(query, (user_id,))
@@ -1330,36 +1182,37 @@ def get_advert_stats_for_user(user_id: int) -> Dict[str, Any]:
         }
 
 
+# ═══════════════════════════════════════════════════════════════
+# COST PRICE
+# ═══════════════════════════════════════════════════════════════
+
 def load_nm_from_financial_reports_in_cost_price(user_id: int) -> Dict[str, Any]:
     query = """
-            INSERT INTO cost_price (nm_id, user_id, sa_name, url_photo)
-            SELECT DISTINCT ON (nm_id) nm_id, \
-                                       user_id, \
-                                       sa_name, \
-                                       'https://img.icons8.com/?size=100&id=118959&format=png&color=000000'
-            FROM (
-                     -- nm_id из financial_reports
-                     SELECT nm_id, user_id, sa_name
-                     FROM financial_reports
-                     WHERE user_id = %s
-                       AND nm_id IS NOT NULL
-                       AND nm_id != 0
+        INSERT INTO cost_price (nm_id, user_id, sa_name, url_photo)
+        SELECT DISTINCT ON (nm_id) nm_id,
+                                   user_id,
+                                   sa_name,
+                                   'https://img.icons8.com/?size=100&id=118959&format=png&color=000000'
+        FROM (
+            SELECT nm_id, user_id, sa_name
+            FROM financial_reports
+            WHERE user_id = %s
+              AND nm_id IS NOT NULL
+              AND nm_id != 0
 
-                     UNION
+            UNION
 
-                     -- nm_id из funnel_product
-                     SELECT nm_id, user_id, vendor_code
-                     FROM funnel_product
-                     WHERE user_id = %s
-                       AND nm_id IS NOT NULL
-                       AND nm_id != 0) AS combined
-            ON CONFLICT (nm_id, user_id) DO NOTHING; \
-            """
+            SELECT nm_id, user_id, vendor_code
+            FROM funnel_product
+            WHERE user_id = %s
+              AND nm_id IS NOT NULL
+              AND nm_id != 0
+        ) AS combined
+        ON CONFLICT (nm_id, user_id) DO NOTHING;
+    """
 
     with get_cursor(commit=True) as cursor:
-        cursor.execute(query, (user_id,user_id))
-        # rowcount покажет количество реально ВСТАВЛЕННЫХ строк
-        # (те, что попали в ON CONFLICT DO NOTHING, не учитываются)
+        cursor.execute(query, (user_id, user_id))
         inserted_count = cursor.rowcount
 
     return {
@@ -1367,21 +1220,14 @@ def load_nm_from_financial_reports_in_cost_price(user_id: int) -> Dict[str, Any]
         "inserted_count": inserted_count
     }
 
+
 def update_photos_in_cost_price(user_id: int, photos: Dict[int, str]) -> int:
     """
     Обновляет url_photo в таблице cost_price для указанного пользователя.
-
-    Args:
-        user_id: ID пользователя
-        photos: Словарь {nm_id: url_photo}
-
-    Returns:
-        Количество обновлённых записей
     """
     if not photos:
         return 0
 
-    # Формируем список значений для batch update
     values = [(url, nm_id, user_id) for nm_id, url in photos.items()]
 
     query = """
@@ -1416,39 +1262,36 @@ def update_photos_in_cost_price(user_id: int, photos: Dict[int, str]) -> int:
             raise
 
 
-
-
-
 def get_cost_price(user_id: int) -> CostPricesApiResponse:
     logger.debug(f"Запуск get_cost_price user_id = {user_id}")
     query = """
-            SELECT
-                   nm_id,
-                   sa_name,
-                   url_photo,
-                   c_price,
-                   fulfillment
-            FROM cost_price
-            WHERE user_id = %s
-            ORDER BY nm_id
-            """
+        SELECT
+            nm_id,
+            sa_name,
+            url_photo,
+            c_price,
+            fulfillment
+        FROM cost_price
+        WHERE user_id = %s
+        ORDER BY nm_id
+    """
 
     with get_cursor(commit=False) as cursor:
         cursor.execute(query, (user_id,))
         rows = cursor.fetchall()
+
     items: List[CostPriceItem] = []
 
     for row in rows:
-        # Безопасное получение cost_price
         cost_price_value = row['c_price']
         fulfillment = row['fulfillment']
         if isinstance(cost_price_value, str):
-            cost_price_value = float(cost_price_value)  # Если строка — fulfillment
+            cost_price_value = float(cost_price_value)
         if isinstance(fulfillment, str):
-            fulfillment = float(fulfillment)   # Если строка — преобразуем
+            fulfillment = float(fulfillment)
 
         item = CostPriceItem(
-            id=str(row['nm_id']),  # nm_id как уникальный id
+            id=str(row['nm_id']),
             nmId=row['nm_id'],
             sa_name=row['sa_name'] or '',
             productImageUrl=row['url_photo'] or '',
@@ -1459,25 +1302,19 @@ def get_cost_price(user_id: int) -> CostPricesApiResponse:
 
     return CostPricesApiResponse(items=items)
 
-def insert_cost_price(user_id: int,nm_id: int, cost_price: float, fulfillment:float):
-    """
-       Вставляет или обновляет себестоимость и фулфилмент для товара.
 
-       Args:
-           user_id: ID пользователя
-           nm_id: ID номенклатуры (артикул WB)
-           cost_price: Себестоимость (может быть None)
-           fulfillment: Фулфилмент (может быть None)
-       """
+def insert_cost_price(user_id: int, nm_id: int, cost_price: float, fulfillment: float):
+    """
+    Вставляет или обновляет себестоимость и фулфилмент для товара.
+    """
     query = """
-            INSERT INTO cost_price (nm_id, user_id, c_price, fulfillment)
-            VALUES (%s, %s, %s, %s) ON CONFLICT (nm_id, user_id) 
-            DO 
-            UPDATE SET
-                c_price = COALESCE (EXCLUDED.c_price, cost_price.c_price), 
-                fulfillment = COALESCE (EXCLUDED.fulfillment, cost_price.fulfillment), 
-                updated_at = NOW() 
-            """
+        INSERT INTO cost_price (nm_id, user_id, c_price, fulfillment)
+        VALUES (%s, %s, %s, %s) ON CONFLICT (nm_id, user_id) 
+        DO UPDATE SET
+            c_price = COALESCE(EXCLUDED.c_price, cost_price.c_price), 
+            fulfillment = COALESCE(EXCLUDED.fulfillment, cost_price.fulfillment), 
+            updated_at = NOW()
+    """
 
     with get_cursor(commit=True) as cursor:
         try:
@@ -1488,40 +1325,3 @@ def insert_cost_price(user_id: int,nm_id: int, cost_price: float, fulfillment:fl
         except Exception as e:
             logger.error(f"User {user_id}: ошибка вставки данных: {e}")
             raise
-
-
-def get_filters_for_user(user_id: int) -> Dict[str, Any]:
-    """
-    Получает уникальные значения для фильтров дашборда.
-
-    Возвращает:
-        - sa_name: уникальные артикулы поставщика
-        - brends: уникальные бренды
-        - category: уникальные категории (subject_name)
-    """
-    query = """
-            SELECT array_agg(DISTINCT sa_name) FILTER (WHERE sa_name IS NOT NULL AND sa_name != '')                AS sa_name, \
-                   array_agg(DISTINCT brand_name) \
-                   FILTER (WHERE brand_name IS NOT NULL AND brand_name != '')                                      AS brends, \
-                   array_agg(DISTINCT subject_name) \
-                   FILTER (WHERE subject_name IS NOT NULL AND subject_name != '')                                  AS category
-            FROM financial_reports
-            WHERE user_id = %s \
-            """
-
-    with get_cursor() as cursor:
-        cursor.execute(query, (user_id,))
-        result = cursor.fetchone()
-
-        if result:
-            return {
-                "sa_name": result["sa_name"],
-                "brends": result["brends"],
-                "category": result["category"],
-            }
-
-        return {
-            "sa_name": None,
-            "brends": None,
-            "category": None,
-        }
