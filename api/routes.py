@@ -77,7 +77,6 @@ def build_metrics(
 ) -> List[dict]:
     """
     Формирует список карточек метрик из сырых данных.
-    Логика полностью сохранена из предыдущей версии.
     """
     logger.debug(f"build_metrics primary: report={primary_data_report}, funnel={primary_data_funnel}")
     logger.debug(f"build_metrics compare: report={compare_data_report}, funnel={compare_data_funnel}")
@@ -89,73 +88,94 @@ def build_metrics(
     if compare_data_advert_stats is None:
         compare_data_advert_stats = {k: 0 for k in primary_data_advert_stats.keys()}
 
+    # ===== Безопасное извлечение данных =====
+    def sf(data, key, default=0.0):
+        """Safe float"""
+        val = data.get(key)
+        if val is None:
+            return default
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return default
+
+    def si(data, key, default=0):
+        """Safe int"""
+        val = data.get(key)
+        if val is None:
+            return default
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return default
+
     # ===== Извлекаем сырые данные =====
 
-    revenue = float(primary_data_report.get('revenue', 0))
-    revenue_prev = float(compare_data_report.get('revenue', 0))
+    revenue = sf(primary_data_report, 'revenue')
+    revenue_prev = sf(compare_data_report, 'revenue')
 
-    acceptance = float(primary_data_report.get('acceptance', 0))
-    acceptance_prev = float(compare_data_report.get('acceptance', 0))
+    acceptance = sf(primary_data_report, 'acceptance')
+    acceptance_prev = sf(compare_data_report, 'acceptance')
 
-    deduction = float(primary_data_report.get('deduction', 0))
-    deduction_prev = float(compare_data_report.get('deduction', 0))
+    deduction = sf(primary_data_report, 'deduction')
+    deduction_prev = sf(compare_data_report, 'deduction')
 
-    storage = float(primary_data_report.get('storage', 0))
-    storage_prev = float(compare_data_report.get('storage', 0))
+    storage = sf(primary_data_report, 'storage')
+    storage_prev = sf(compare_data_report, 'storage')
 
-    ppvz_for_pay = float(primary_data_report.get('ppvz_for_pay', 0))
-    ppvz_for_pay_prev = float(compare_data_report.get('ppvz_for_pay', 0))
+    ppvz_for_pay = sf(primary_data_report, 'ppvz_for_pay')
+    ppvz_for_pay_prev = sf(compare_data_report, 'ppvz_for_pay')
 
-    sum_cost_price = float(primary_data_report.get('sum_cost_price', 0))
-    sum_cost_price_prev = float(compare_data_report.get('sum_cost_price', 0))
+    sum_cost_price = sf(primary_data_report, 'sum_cost_price')
+    sum_cost_price_prev = sf(compare_data_report, 'sum_cost_price')
 
-    sum_for_contribution = float(primary_data_report.get('sum_for_contribution', 0))
-    sum_for_contribution_prev = float(compare_data_report.get('sum_for_contribution', 0))
+    sum_for_contribution = sf(primary_data_report, 'sum_for_contribution')
+    sum_for_contribution_prev = sf(compare_data_report, 'sum_for_contribution')
 
-    returns_sum = float(primary_data_report.get('returns_sum', 0))
-    returns_prev = float(compare_data_report.get('returns_sum', 0))
+    returns_sum = sf(primary_data_report, 'returns_sum')
+    returns_prev = sf(compare_data_report, 'returns_sum')
 
-    returns_qty = int(primary_data_report.get('returns_quantity', 0))
-    returns_qty_prev = int(compare_data_report.get('returns_quantity', 0))
+    returns_qty = si(primary_data_report, 'returns_quantity')
+    returns_qty_prev = si(compare_data_report, 'returns_quantity')
 
-    logistics = float(primary_data_report.get('logistics', 0))
-    logistics_prev = float(compare_data_report.get('logistics', 0))
+    logistics = sf(primary_data_report, 'logistics')
+    logistics_prev = sf(compare_data_report, 'logistics')
 
-    commission = float(primary_data_report.get('commission', 0))
-    commission_prev = float(compare_data_report.get('commission', 0))
+    commission = sf(primary_data_report, 'commission')
+    commission_prev = sf(compare_data_report, 'commission')
 
-    penalties = float(primary_data_report.get('penalties', 0))
-    penalties_prev = float(compare_data_report.get('penalties', 0))
+    penalties = sf(primary_data_report, 'penalties')
+    penalties_prev = sf(compare_data_report, 'penalties')
 
-    orders_rub = float(primary_data_funnel.get('order_sum', 0))
-    orders_rub_prev = float(compare_data_funnel.get('order_sum', 0))
+    orders_rub = sf(primary_data_funnel, 'order_sum')
+    orders_rub_prev = sf(compare_data_funnel, 'order_sum')
 
-    orders_qty = int(primary_data_funnel.get('order_count', 0))
-    orders_qty_prev = int(compare_data_funnel.get('order_count', 0))
+    orders_qty = si(primary_data_funnel, 'order_count')
+    orders_qty_prev = si(compare_data_funnel, 'order_count')
 
-    sales_rub = float(primary_data_report.get('revenue', 0))
-    sales_rub_prev = float(compare_data_report.get('revenue', 0))
+    sales_rub = sf(primary_data_report, 'revenue')
+    sales_rub_prev = sf(compare_data_report, 'revenue')
 
-    sales_qty = int(primary_data_report.get('sales_count', 0))
-    sales_qty_prev = int(compare_data_report.get('sales_count', 0))
+    sales_qty = si(primary_data_report, 'sales_count')
+    sales_qty_prev = si(compare_data_report, 'sales_count')
 
-    cancels_qty = int(primary_data_funnel.get('cancel_count', 0))
-    cancels_qty_prev = int(compare_data_funnel.get('cancel_count', 0))
+    cancels_qty = si(primary_data_funnel, 'cancel_count')
+    cancels_qty_prev = si(compare_data_funnel, 'cancel_count')
 
-    ad_expense = float(primary_data_advert_stats.get('ad_expense', 0))
-    ad_expense_prev = float(compare_data_advert_stats.get('ad_expense', 0))
+    ad_expense = sf(primary_data_advert_stats, 'ad_expense')
+    ad_expense_prev = sf(compare_data_advert_stats, 'ad_expense')
 
-    stock_qty = int(primary_data_funnel.get('stocks_balance_sum', 0))
-    stock_qty_prev = int(compare_data_funnel.get('stocks_balance_sum', 0))
+    stock_qty = si(primary_data_funnel, 'stocks_balance_sum')
+    stock_qty_prev = si(compare_data_funnel, 'stocks_balance_sum')
 
-    turnover = float(primary_data_report.get('turnover', 0))
-    turnover_prev = float(compare_data_report.get('turnover', 0))
+    turnover = sf(primary_data_report, 'turnover')
+    turnover_prev = sf(compare_data_report, 'turnover')
 
-    cr_cart = float(primary_data_funnel.get('conversions_add_to_cart_percent', 0))
-    cr_cart_prev = float(compare_data_funnel.get('conversions_add_to_cart_percent', 0))
+    cr_cart = sf(primary_data_funnel, 'conversions_add_to_cart_percent')
+    cr_cart_prev = sf(compare_data_funnel, 'conversions_add_to_cart_percent')
 
-    cr_order = float(primary_data_funnel.get('conversions_cart_to_order_percent', 0))
-    cr_order_prev = float(compare_data_funnel.get('conversions_cart_to_order_percent', 0))
+    cr_order = sf(primary_data_funnel, 'conversions_cart_to_order_percent')
+    cr_order_prev = sf(compare_data_funnel, 'conversions_cart_to_order_percent')
 
     # ===== Вычисляем производные метрики =====
 
@@ -175,8 +195,7 @@ def build_metrics(
     buyout_percent_prev = (sales_qty_prev / orders_qty_prev * 100) if orders_qty_prev > 0 else 0
 
     logistics_unit = (logistics / (sales_qty - returns_qty)) if (sales_qty - returns_qty) > 0 else 0
-    logistics_unit_prev = (logistics_prev / (sales_qty_prev - returns_qty_prev)) if (
-                                                                                                sales_qty_prev - returns_qty_prev) > 0 else 0
+    logistics_unit_prev = (logistics_prev / (sales_qty_prev - returns_qty_prev)) if (sales_qty_prev - returns_qty_prev) > 0 else 0
 
     drr_orders = (ad_expense / orders_rub * 100) if orders_rub > 0 else 0
     drr_orders_prev = (ad_expense_prev / orders_rub_prev * 100) if orders_rub_prev > 0 else 0

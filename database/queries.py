@@ -22,22 +22,13 @@ import json
 # ═══════════════════════════════════════════════════════════════
 
 def _build_filters(
-    base_params: Dict[str, Any],
-    brands: List[str] = None,
-    categories: List[str] = None,
-    sa_names: List[str] = None
+        base_params: Dict[str, Any],
+        brands: List[str] = None,
+        categories: List[str] = None,
+        sa_names: List[str] = None
 ) -> tuple:
     """
     Строит SQL условия для фильтров.
-
-    Args:
-        base_params: Базовые параметры запроса (user_id, date_from, date_to)
-        brands: Список брендов для фильтрации
-        categories: Список категорий для фильтрации
-        sa_names: Список артикулов для фильтрации
-
-    Returns:
-        (sql_conditions, updated_params)
     """
     conditions = []
     params = base_params.copy()
@@ -56,19 +47,21 @@ def _build_filters(
 
     sql = ""
     if conditions:
-        sql = " AND " + " AND ".join(conditions)
+        # Добавляем перенос строки в конце!
+        sql = "\n          AND " + "\n          AND ".join(conditions) + "\n"
 
     return sql, params
 
 
 def _build_filters_funnel(
-    base_params: Dict[str, Any],
-    brands: List[str] = None,
-    categories: List[str] = None,
-    sa_names: List[str] = None
+        base_params: Dict[str, Any],
+        brands: List[str] = None,
+        categories: List[str] = None,
+        sa_names: List[str] = None
 ) -> tuple:
     """
-    Строит SQL условия для фильтров (для funnel и advert — category вместо subject_name).
+    Строит SQL условия для фильтров (для funnel и advert).
+    Использует 'category' вместо 'subject_name'.
     """
     conditions = []
     params = base_params.copy()
@@ -87,7 +80,8 @@ def _build_filters_funnel(
 
     sql = ""
     if conditions:
-        sql = " AND " + " AND ".join(conditions)
+        # Добавляем перенос строки в конце!
+        sql = "\n          AND " + "\n          AND ".join(conditions) + "\n"
 
     return sql, params
 
@@ -363,7 +357,7 @@ def get_dynamic_for_period_from_report(
         FROM v_report_dashboard
         WHERE user_id = %(user_id)s
           AND date_to::date >= %(date_from)s::date
-          AND date_to::date <= %(date_to)s::date group by date_to
+          AND date_to::date <= %(date_to)s::date
         {filter_sql}
         GROUP BY date_to::date
         ORDER BY date_to::date ASC
