@@ -4,7 +4,7 @@
 """
 
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 
 
 class DateRange(BaseModel):
@@ -14,7 +14,12 @@ class DateRange(BaseModel):
 
 
 class DateRangeRequest(BaseModel):
-    """Запрос с датами (для /metrics и /dynamics)"""
+    """Запрос с датами (для /metrics, /dynamics, /details)"""
     primary: DateRange
     compare: Optional[DateRange] = None
     user_id: Optional[int] = None
+
+    # Фильтры
+    brends: Optional[List[str]] = None
+    category: Optional[List[str]] = None
+    sa_name: Optional[List[str]] = None

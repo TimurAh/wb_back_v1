@@ -17,6 +17,85 @@ from crypto import decrypt_token
 import json
 
 
+# ═══════════════════════════════════════════════════════════════
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ═══════════════════════════════════════════════════════════════
+
+def _build_filters(
+    base_params: Dict[str, Any],
+    brands: List[str] = None,
+    categories: List[str] = None,
+    sa_names: List[str] = None
+) -> tuple:
+    """
+    Строит SQL условия для фильтров.
+
+    Args:
+        base_params: Базовые параметры запроса (user_id, date_from, date_to)
+        brands: Список брендов для фильтрации
+        categories: Список категорий для фильтрации
+        sa_names: Список артикулов для фильтрации
+
+    Returns:
+        (sql_conditions, updated_params)
+    """
+    conditions = []
+    params = base_params.copy()
+
+    if brands and len(brands) > 0:
+        conditions.append("brand_name = ANY(%(brands)s)")
+        params["brands"] = brands
+
+    if categories and len(categories) > 0:
+        conditions.append("subject_name = ANY(%(categories)s)")
+        params["categories"] = categories
+
+    if sa_names and len(sa_names) > 0:
+        conditions.append("sa_name = ANY(%(sa_names)s)")
+        params["sa_names"] = sa_names
+
+    sql = ""
+    if conditions:
+        sql = " AND " + " AND ".join(conditions)
+
+    return sql, params
+
+
+def _build_filters_funnel(
+    base_params: Dict[str, Any],
+    brands: List[str] = None,
+    categories: List[str] = None,
+    sa_names: List[str] = None
+) -> tuple:
+    """
+    Строит SQL условия для фильтров (для funnel и advert — category вместо subject_name).
+    """
+    conditions = []
+    params = base_params.copy()
+
+    if brands and len(brands) > 0:
+        conditions.append("brand_name = ANY(%(brands)s)")
+        params["brands"] = brands
+
+    if categories and len(categories) > 0:
+        conditions.append("category = ANY(%(categories)s)")
+        params["categories"] = categories
+
+    if sa_names and len(sa_names) > 0:
+        conditions.append("sa_name = ANY(%(sa_names)s)")
+        params["sa_names"] = sa_names
+
+    sql = ""
+    if conditions:
+        sql = " AND " + " AND ".join(conditions)
+
+    return sql, params
+
+
+# ═══════════════════════════════════════════════════════════════
+# ПОЛЬЗОВАТЕЛИ
+# ═══════════════════════════════════════════════════════════════
+
 def get_users_with_tokens() -> List[Dict[str, Any]]:
     """
     Получает всех пользователей с валидными wb_token
@@ -123,18 +202,29 @@ def get_users_load_info() -> List[Dict[str, Any]]:
 
 
 # ═══════════════════════════════════════════════════════════════
-# ЗАПРОСЫ ДЛЯ DASHBOARD (через VIEW)
+# ЗАПРОСЫ ДЛЯ DASHBOARD — REPORT (через VIEW)
 # ═══════════════════════════════════════════════════════════════
 
 def get_metrics_for_period_from_report(
     user_id: int,
     date_from: str,
-    date_to: str
+    date_to: str,
+    brands: List[str] = None,
+    categories: List[str] = None,
+    sa_names: List[str] = None
 ) -> Dict[str, Any]:
     """
     Рассчитывает агрегированные метрики за период из v_report_dashboard.
     """
-    query = """
+    base_params = {
+        "user_id": user_id,
+        "date_from": date_from,
+        "date_to": date_to
+    }
+
+    filter_sql, params = _build_filters(base_params, brands, categories, sa_names)
+
+    query = f"""
         SELECT
             COALESCE(SUM(
                 CASE WHEN doc_type_name = 'Продажа' 
@@ -187,27 +277,39 @@ def get_metrics_for_period_from_report(
                     THEN COALESCE(deduction, 0) ELSE 0 END
             ), 0) as deduction
         FROM v_report_dashboard
-        WHERE user_id = %s
-          AND date_to::date >= %s::date
-          AND date_to::date <= %s::date
+        WHERE user_id = %(user_id)s
+          AND date_to::date >= %(date_from)s::date
+          AND date_to::date <= %(date_to)s::date
+          {filter_sql}
     """
 
     with get_cursor() as cursor:
-        cursor.execute(query, (user_id, date_from, date_to))
+        cursor.execute(query, params)
         result = cursor.fetchone()
         return dict(result) if result else {}
 
 
 def get_dynamic_for_period_from_report(
-    user_id: int,
-    date_from: str,
-    date_to: str
+        user_id: int,
+        date_from: str,
+        date_to: str,
+        brands: List[str] = None,
+        categories: List[str] = None,
+        sa_names: List[str] = None
 ) -> List[Dict[str, Any]]:
     """
     Рассчитывает данные для динамики за период из v_report_dashboard.
     """
-    query = """
+    base_params = {
+        "user_id": user_id,
+        "date_from": date_from,
+        "date_to": date_to
+    }
+
+    filter_sql, params = _build_filters(base_params, brands, categories, sa_names)
+    query = f"""
         SELECT 
+            date_to::date as date,
             COALESCE(SUM(
                 CASE WHEN doc_type_name = 'Продажа' 
                     THEN retail_price * COALESCE(quantity, 1) ELSE 0 END
@@ -257,18 +359,18 @@ def get_dynamic_for_period_from_report(
                 CASE WHEN supplier_oper_name = 'Удержание' 
                     AND bonus_type_name NOT LIKE '%%WB Продвижение%%'
                     THEN COALESCE(deduction, 0) ELSE 0 END
-            ), 0) as deduction,
-            date_to as date
+            ), 0) as deduction
         FROM v_report_dashboard
-        WHERE user_id = %s
-          AND date_to::date >= %s::date
-          AND date_to::date <= %s::date
-        GROUP BY date_to 
-        ORDER BY date_to ASC
+        WHERE user_id = %(user_id)s
+          AND date_to::date >= %(date_from)s::date
+          AND date_to::date <= %(date_to)s::date group by date_to
+        {filter_sql}
+        GROUP BY date_to::date
+        ORDER BY date_to::date ASC
     """
 
     with get_cursor() as cursor:
-        cursor.execute(query, (user_id, date_from, date_to))
+        cursor.execute(query, params)
         result = cursor.fetchall()
         return [dict(row) for row in result] if result else []
 
@@ -276,12 +378,23 @@ def get_dynamic_for_period_from_report(
 def get_detail_for_period_from_report(
     user_id: int,
     date_from: str,
-    date_to: str
+    date_to: str,
+    brands: List[str] = None,
+    categories: List[str] = None,
+    sa_names: List[str] = None
 ) -> List[Dict[str, Any]]:
     """
     Рассчитывает данные детализации за период из v_report_dashboard.
     """
-    query = """
+    base_params = {
+        "user_id": user_id,
+        "date_from": date_from,
+        "date_to": date_to
+    }
+
+    filter_sql, params = _build_filters(base_params, brands, categories, sa_names)
+
+    query = f"""
         SELECT 
             COALESCE(SUM(
                 CASE WHEN doc_type_name = 'Продажа' 
@@ -337,16 +450,17 @@ def get_detail_for_period_from_report(
             MAX(product_image_url) as product_image_url,
             MAX(COALESCE(cp_sa_name, sa_name)) as sa_name
         FROM v_report_dashboard
-        WHERE user_id = %s
-          AND date_to::date >= %s::date
-          AND date_to::date <= %s::date
+        WHERE user_id = %(user_id)s
+          AND date_to::date >= %(date_from)s::date
+          AND date_to::date <= %(date_to)s::date
           AND nm_id > 0
+          {filter_sql}
         GROUP BY nm_id 
         ORDER BY nm_id ASC
     """
 
     with get_cursor() as cursor:
-        cursor.execute(query, (user_id, date_from, date_to))
+        cursor.execute(query, params)
         result = cursor.fetchall()
         return [dict(row) for row in result] if result else []
 
@@ -382,276 +496,30 @@ def get_filters_for_user(user_id: int) -> Dict[str, Any]:
         }
 
 
-# ═══════════════════════════════════════════════════════════════
-# ЗАПРОСЫ ДЛЯ FUNNEL (через VIEW)
-# ═══════════════════════════════════════════════════════════════
-
-def get_metrics_for_period_from_funnel(
-    user_id: int,
-    date_from: str,
-    date_to: str
-) -> Dict[str, Any]:
-    """
-    Рассчитывает агрегированные метрики за период из v_funnel_dashboard.
-    """
-    query = """
-        WITH daily AS (
-            SELECT 
-                date_funnel,
-                SUM(order_sum) AS order_sum,
-                SUM(order_count) AS order_count,
-                SUM(stocks_balance) AS stocks_balance_sum,
-                SUM(open_count) AS open_count,
-                SUM(cart_count) AS cart_count,
-                SUM(cancel_sum) AS cancel_sum,
-                SUM(cancel_count) AS cancel_count,
-                AVG(NULLIF(conversions_buyout_percent, 0)) AS conversions_buyout_percent
-            FROM v_funnel_dashboard
-            WHERE user_id = %(user_id)s
-              AND date_funnel >= %(date_from)s::date
-              AND date_funnel <= %(date_to)s::date
-            GROUP BY date_funnel
-        )
-        SELECT 
-            COALESCE(SUM(order_sum), 0) AS order_sum,
-            COALESCE(SUM(order_count), 0) AS order_count,
-            (SELECT MAX(stocks_balance_sum) FROM daily) AS stocks_balance_sum,
-            COALESCE(SUM(open_count), 0) AS open_count,
-            COALESCE(SUM(cancel_sum), 0) AS cancel_sum,
-            COALESCE(SUM(cancel_count), 0) AS cancel_count,
-            CASE 
-                WHEN SUM(open_count) > 0 
-                THEN SUM(cart_count) * 100.0 / SUM(open_count) 
-                ELSE 0 
-            END AS conversions_add_to_cart_percent,
-            CASE 
-                WHEN SUM(cart_count) > 0 
-                THEN SUM(order_count) * 100.0 / SUM(cart_count) 
-                ELSE 0 
-            END AS conversions_cart_to_order_percent,
-            AVG(NULLIF(conversions_buyout_percent, 0)) AS conversions_buyout_percent
-        FROM v_funnel_dashboard
-        WHERE user_id = %(user_id)s
-          AND date_funnel >= %(date_from)s::date
-          AND date_funnel <= %(date_to)s::date
-    """
-
-    with get_cursor() as cursor:
-        cursor.execute(query, {
-            "user_id": user_id,
-            "date_from": date_from,
-            "date_to": date_to
-        })
-        result = cursor.fetchone()
-        return dict(result) if result else {}
-
-
-def get_dynamic_for_period_from_funnel(
-    user_id: int,
-    date_from: str,
-    date_to: str
-) -> List[Dict[str, Any]]:
-    """
-    Рассчитывает метрики из v_funnel_dashboard с группировкой по дням.
-    """
-    query = """
-        SELECT 
-            date_funnel AS date,
-            COALESCE(SUM(order_sum), 0) AS order_sum,
-            COALESCE(SUM(order_count), 0) AS order_count,
-            COALESCE(SUM(stocks_balance), 0) AS stocks_balance_sum,
-            COALESCE(SUM(open_count), 0) AS open_count,
-            COALESCE(SUM(cart_count), 0) AS cart_count,
-            COALESCE(SUM(cancel_sum), 0) AS cancel_sum,
-            COALESCE(SUM(cancel_count), 0) AS cancel_count,
-            CASE 
-                WHEN SUM(open_count) > 0 
-                THEN SUM(cart_count) * 100.0 / SUM(open_count) 
-                ELSE 0 
-            END AS conversions_add_to_cart_percent,
-            CASE 
-                WHEN SUM(cart_count) > 0 
-                THEN SUM(order_count) * 100.0 / SUM(cart_count) 
-                ELSE 0 
-            END AS conversions_cart_to_order_percent,
-            AVG(NULLIF(conversions_buyout_percent, 0)) AS conversions_buyout_percent
-        FROM v_funnel_dashboard
-        WHERE user_id = %(user_id)s
-          AND date_funnel >= %(date_from)s::date
-          AND date_funnel <= %(date_to)s::date
-        GROUP BY date_funnel
-        ORDER BY date_funnel
-    """
-
-    with get_cursor() as cursor:
-        cursor.execute(query, {
-            "user_id": user_id,
-            "date_from": date_from,
-            "date_to": date_to
-        })
-        result = cursor.fetchall()
-        return [dict(row) for row in result] if result else []
-
-
-def get_detail_for_period_from_funnel(
-    user_id: int,
-    date_from: str,
-    date_to: str
-) -> List[Dict[str, Any]]:
-    """
-    Рассчитывает метрики из v_funnel_dashboard с группировкой по nm_id.
-    """
-    query = """
-        SELECT 
-            nm_id,
-            COALESCE(SUM(order_sum), 0) AS order_sum,
-            COALESCE(SUM(order_count), 0) AS order_count,
-            COALESCE(SUM(stocks_balance), 0) AS stocks_balance_sum,
-            COALESCE(SUM(open_count), 0) AS open_count,
-            COALESCE(SUM(cart_count), 0) AS cart_count,
-            COALESCE(SUM(cancel_sum), 0) AS cancel_sum,
-            COALESCE(SUM(cancel_count), 0) AS cancel_count,
-            CASE 
-                WHEN SUM(open_count) > 0 
-                THEN SUM(cart_count) * 100.0 / SUM(open_count) 
-                ELSE 0 
-            END AS conversions_add_to_cart_percent,
-            CASE 
-                WHEN SUM(cart_count) > 0 
-                THEN SUM(order_count) * 100.0 / SUM(cart_count) 
-                ELSE 0 
-            END AS conversions_cart_to_order_percent,
-            AVG(NULLIF(conversions_buyout_percent, 0)) AS conversions_buyout_percent,
-            MAX(vendor_code) AS vendor_code,
-            MAX(product_image_url) AS product_image_url,
-            MAX(sa_name) AS sa_name,
-            MAX(category) AS category
-        FROM v_funnel_dashboard
-        WHERE user_id = %(user_id)s
-          AND date_funnel >= %(date_from)s::date
-          AND date_funnel <= %(date_to)s::date
-        GROUP BY nm_id
-        ORDER BY nm_id
-    """
-
-    with get_cursor() as cursor:
-        cursor.execute(query, {
-            "user_id": user_id,
-            "date_from": date_from,
-            "date_to": date_to
-        })
-        result = cursor.fetchall()
-        return [dict(row) for row in result] if result else []
-
-
-# ═══════════════════════════════════════════════════════════════
-# ЗАПРОСЫ ДЛЯ ADVERT (через VIEW)
-# ═══════════════════════════════════════════════════════════════
-
-def get_metrics_for_period_from_advert_stats(
-    user_id: int,
-    date_from: str,
-    date_to: str
-) -> Dict[str, Any]:
-    """
-    Рассчитывает агрегированные метрики за период из v_advert_dashboard.
-    """
-    query = """
-        SELECT 
-            COALESCE(SUM(ad_expense), 0) AS ad_expense
-        FROM v_advert_dashboard
-        WHERE user_id = %(user_id)s
-          AND date_stat >= %(date_from)s::date
-          AND date_stat <= %(date_to)s::date
-    """
-
-    with get_cursor() as cursor:
-        cursor.execute(query, {
-            "user_id": user_id,
-            "date_from": date_from,
-            "date_to": date_to
-        })
-        result = cursor.fetchone()
-        return dict(result) if result else {"ad_expense": 0}
-
-
-def get_dynamic_for_period_from_advert_stats(
-    user_id: int,
-    date_from: str,
-    date_to: str
-) -> List[Dict[str, Any]]:
-    """
-    Рассчитывает данные для динамики за период из v_advert_dashboard.
-    """
-    query = """
-        SELECT 
-            date_stat AS date,
-            COALESCE(SUM(ad_expense), 0) AS ad_expense
-        FROM v_advert_dashboard
-        WHERE user_id = %(user_id)s
-          AND date_stat >= %(date_from)s::date
-          AND date_stat <= %(date_to)s::date
-        GROUP BY date_stat
-        ORDER BY date_stat ASC
-    """
-
-    with get_cursor() as cursor:
-        cursor.execute(query, {
-            "user_id": user_id,
-            "date_from": date_from,
-            "date_to": date_to
-        })
-        result = cursor.fetchall()
-        return [dict(row) for row in result] if result else []
-
-
-def get_detail_for_period_from_advert_stats(
-    user_id: int,
-    date_from: str,
-    date_to: str
-) -> List[Dict[str, Any]]:
-    """
-    Рассчитывает данные детализации за период из v_advert_dashboard.
-    """
-    query = """
-        SELECT 
-            nm_id,
-            COALESCE(SUM(ad_expense), 0) AS ad_expense,
-            MAX(product_image_url) AS product_image_url,
-            MAX(sa_name) AS sa_name,
-            MAX(category) AS category,
-            MAX(brand_name) AS brand_name
-        FROM v_advert_dashboard
-        WHERE user_id = %(user_id)s
-          AND date_stat >= %(date_from)s::date
-          AND date_stat <= %(date_to)s::date
-        GROUP BY nm_id
-        ORDER BY nm_id ASC
-    """
-
-    with get_cursor() as cursor:
-        cursor.execute(query, {
-            "user_id": user_id,
-            "date_from": date_from,
-            "date_to": date_to
-        })
-        result = cursor.fetchall()
-        return [dict(row) for row in result] if result else []
-
-
 def get_details_by_product(
     user_id: int,
     date_from: str,
-    date_to: str
+    date_to: str,
+    brands: List[str] = None,
+    categories: List[str] = None,
+    sa_names: List[str] = None
 ) -> List[Dict[str, Any]]:
     """
     Получает детализацию по товарам (артикулам).
     """
-    query = """
+    base_params = {
+        "user_id": user_id,
+        "date_from": date_from,
+        "date_to": date_to
+    }
+
+    filter_sql, params = _build_filters(base_params, brands, categories, sa_names)
+
+    query = f"""
         SELECT 
             nm_id,
-            sa_name as product_name,
-            brand_name,
+            MAX(sa_name) as product_name,
+            MAX(brand_name) as brand_name,
             COALESCE(SUM(ppvz_for_pay), 0) as net_profit_rub,
             COALESCE(SUM(
                 CASE 
@@ -683,17 +551,18 @@ def get_details_by_product(
                 END
             ), 0) as returns_count
         FROM v_report_dashboard
-        WHERE user_id = %s
-          AND date_to::date >= %s::date
-          AND date_to::date <= %s::date
+        WHERE user_id = %(user_id)s
+          AND date_to::date >= %(date_from)s::date
+          AND date_to::date <= %(date_to)s::date
           AND nm_id IS NOT NULL
-        GROUP BY nm_id, sa_name, brand_name
-        ORDER BY COALESCE(SUM(ppvz_for_pay), 0) DESC
+          {filter_sql}
+        GROUP BY nm_id
+        ORDER BY SUM(ppvz_for_pay) DESC NULLS LAST
         LIMIT 50
     """
 
     with get_cursor() as cursor:
-        cursor.execute(query, (user_id, date_from, date_to))
+        cursor.execute(query, params)
         results = cursor.fetchall()
 
         details = []
@@ -741,6 +610,312 @@ def get_details_by_product(
             })
 
         return details
+
+
+# ═══════════════════════════════════════════════════════════════
+# ЗАПРОСЫ ДЛЯ DASHBOARD — FUNNEL (через VIEW)
+# ═══════════════════════════════════════════════════════════════
+
+def get_metrics_for_period_from_funnel(
+    user_id: int,
+    date_from: str,
+    date_to: str,
+    brands: List[str] = None,
+    categories: List[str] = None,
+    sa_names: List[str] = None
+) -> Dict[str, Any]:
+    """
+    Рассчитывает агрегированные метрики за период из v_funnel_dashboard.
+    """
+    base_params = {
+        "user_id": user_id,
+        "date_from": date_from,
+        "date_to": date_to
+    }
+
+    filter_sql, params = _build_filters_funnel(base_params, brands, categories, sa_names)
+
+    query = f"""
+        WITH daily AS (
+            SELECT 
+                date_funnel,
+                SUM(order_sum) AS order_sum,
+                SUM(order_count) AS order_count,
+                SUM(stocks_balance) AS stocks_balance_sum,
+                SUM(open_count) AS open_count,
+                SUM(cart_count) AS cart_count,
+                SUM(cancel_sum) AS cancel_sum,
+                SUM(cancel_count) AS cancel_count,
+                AVG(NULLIF(conversions_buyout_percent, 0)) AS conversions_buyout_percent
+            FROM v_funnel_dashboard
+            WHERE user_id = %(user_id)s
+              AND date_funnel >= %(date_from)s::date
+              AND date_funnel <= %(date_to)s::date
+              {filter_sql}
+            GROUP BY date_funnel
+        )
+        SELECT 
+            COALESCE(SUM(order_sum), 0) AS order_sum,
+            COALESCE(SUM(order_count), 0) AS order_count,
+            (SELECT MAX(stocks_balance_sum) FROM daily) AS stocks_balance_sum,
+            COALESCE(SUM(open_count), 0) AS open_count,
+            COALESCE(SUM(cancel_sum), 0) AS cancel_sum,
+            COALESCE(SUM(cancel_count), 0) AS cancel_count,
+            CASE 
+                WHEN SUM(open_count) > 0 
+                THEN SUM(cart_count) * 100.0 / SUM(open_count) 
+                ELSE 0 
+            END AS conversions_add_to_cart_percent,
+            CASE 
+                WHEN SUM(cart_count) > 0 
+                THEN SUM(order_count) * 100.0 / SUM(cart_count) 
+                ELSE 0 
+            END AS conversions_cart_to_order_percent,
+            AVG(NULLIF(conversions_buyout_percent, 0)) AS conversions_buyout_percent
+        FROM v_funnel_dashboard
+        WHERE user_id = %(user_id)s
+          AND date_funnel >= %(date_from)s::date
+          AND date_funnel <= %(date_to)s::date
+          {filter_sql}
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(query, params)
+        result = cursor.fetchone()
+        return dict(result) if result else {}
+
+
+def get_dynamic_for_period_from_funnel(
+    user_id: int,
+    date_from: str,
+    date_to: str,
+    brands: List[str] = None,
+    categories: List[str] = None,
+    sa_names: List[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Рассчитывает метрики из v_funnel_dashboard с группировкой по дням.
+    """
+    base_params = {
+        "user_id": user_id,
+        "date_from": date_from,
+        "date_to": date_to
+    }
+
+    filter_sql, params = _build_filters_funnel(base_params, brands, categories, sa_names)
+
+    query = f"""
+        SELECT 
+            date_funnel AS date,
+            COALESCE(SUM(order_sum), 0) AS order_sum,
+            COALESCE(SUM(order_count), 0) AS order_count,
+            COALESCE(SUM(stocks_balance), 0) AS stocks_balance_sum,
+            COALESCE(SUM(open_count), 0) AS open_count,
+            COALESCE(SUM(cart_count), 0) AS cart_count,
+            COALESCE(SUM(cancel_sum), 0) AS cancel_sum,
+            COALESCE(SUM(cancel_count), 0) AS cancel_count,
+            CASE 
+                WHEN SUM(open_count) > 0 
+                THEN SUM(cart_count) * 100.0 / SUM(open_count) 
+                ELSE 0 
+            END AS conversions_add_to_cart_percent,
+            CASE 
+                WHEN SUM(cart_count) > 0 
+                THEN SUM(order_count) * 100.0 / SUM(cart_count) 
+                ELSE 0 
+            END AS conversions_cart_to_order_percent,
+            AVG(NULLIF(conversions_buyout_percent, 0)) AS conversions_buyout_percent
+        FROM v_funnel_dashboard
+        WHERE user_id = %(user_id)s
+          AND date_funnel >= %(date_from)s::date
+          AND date_funnel <= %(date_to)s::date
+          {filter_sql}
+        GROUP BY date_funnel
+        ORDER BY date_funnel
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(query, params)
+        result = cursor.fetchall()
+        return [dict(row) for row in result] if result else []
+
+
+def get_detail_for_period_from_funnel(
+    user_id: int,
+    date_from: str,
+    date_to: str,
+    brands: List[str] = None,
+    categories: List[str] = None,
+    sa_names: List[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Рассчитывает метрики из v_funnel_dashboard с группировкой по nm_id.
+    """
+    base_params = {
+        "user_id": user_id,
+        "date_from": date_from,
+        "date_to": date_to
+    }
+
+    filter_sql, params = _build_filters_funnel(base_params, brands, categories, sa_names)
+
+    query = f"""
+        SELECT 
+            nm_id,
+            COALESCE(SUM(order_sum), 0) AS order_sum,
+            COALESCE(SUM(order_count), 0) AS order_count,
+            COALESCE(SUM(stocks_balance), 0) AS stocks_balance_sum,
+            COALESCE(SUM(open_count), 0) AS open_count,
+            COALESCE(SUM(cart_count), 0) AS cart_count,
+            COALESCE(SUM(cancel_sum), 0) AS cancel_sum,
+            COALESCE(SUM(cancel_count), 0) AS cancel_count,
+            CASE 
+                WHEN SUM(open_count) > 0 
+                THEN SUM(cart_count) * 100.0 / SUM(open_count) 
+                ELSE 0 
+            END AS conversions_add_to_cart_percent,
+            CASE 
+                WHEN SUM(cart_count) > 0 
+                THEN SUM(order_count) * 100.0 / SUM(cart_count) 
+                ELSE 0 
+            END AS conversions_cart_to_order_percent,
+            AVG(NULLIF(conversions_buyout_percent, 0)) AS conversions_buyout_percent,
+            MAX(vendor_code) AS vendor_code,
+            MAX(product_image_url) AS product_image_url,
+            MAX(sa_name) AS sa_name,
+            MAX(category) AS category
+        FROM v_funnel_dashboard
+        WHERE user_id = %(user_id)s
+          AND date_funnel >= %(date_from)s::date
+          AND date_funnel <= %(date_to)s::date
+          {filter_sql}
+        GROUP BY nm_id
+        ORDER BY nm_id
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(query, params)
+        result = cursor.fetchall()
+        return [dict(row) for row in result] if result else []
+
+
+# ═══════════════════════════════════════════════════════════════
+# ЗАПРОСЫ ДЛЯ DASHBOARD — ADVERT (через VIEW)
+# ═══════════════════════════════════════════════════════════════
+
+def get_metrics_for_period_from_advert_stats(
+    user_id: int,
+    date_from: str,
+    date_to: str,
+    brands: List[str] = None,
+    categories: List[str] = None,
+    sa_names: List[str] = None
+) -> Dict[str, Any]:
+    """
+    Рассчитывает агрегированные метрики за период из v_advert_dashboard.
+    """
+    base_params = {
+        "user_id": user_id,
+        "date_from": date_from,
+        "date_to": date_to
+    }
+
+    filter_sql, params = _build_filters_funnel(base_params, brands, categories, sa_names)
+
+    query = f"""
+        SELECT 
+            COALESCE(SUM(ad_expense), 0) AS ad_expense
+        FROM v_advert_dashboard
+        WHERE user_id = %(user_id)s
+          AND date_stat >= %(date_from)s::date
+          AND date_stat <= %(date_to)s::date
+          {filter_sql}
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(query, params)
+        result = cursor.fetchone()
+        return dict(result) if result else {"ad_expense": 0}
+
+
+def get_dynamic_for_period_from_advert_stats(
+    user_id: int,
+    date_from: str,
+    date_to: str,
+    brands: List[str] = None,
+    categories: List[str] = None,
+    sa_names: List[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Рассчитывает данные для динамики за период из v_advert_dashboard.
+    """
+    base_params = {
+        "user_id": user_id,
+        "date_from": date_from,
+        "date_to": date_to
+    }
+
+    filter_sql, params = _build_filters_funnel(base_params, brands, categories, sa_names)
+
+    query = f"""
+        SELECT 
+            date_stat AS date,
+            COALESCE(SUM(ad_expense), 0) AS ad_expense
+        FROM v_advert_dashboard
+        WHERE user_id = %(user_id)s
+          AND date_stat >= %(date_from)s::date
+          AND date_stat <= %(date_to)s::date
+          {filter_sql}
+        GROUP BY date_stat
+        ORDER BY date_stat ASC
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(query, params)
+        result = cursor.fetchall()
+        return [dict(row) for row in result] if result else []
+
+
+def get_detail_for_period_from_advert_stats(
+    user_id: int,
+    date_from: str,
+    date_to: str,
+    brands: List[str] = None,
+    categories: List[str] = None,
+    sa_names: List[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Рассчитывает данные детализации за период из v_advert_dashboard.
+    """
+    base_params = {
+        "user_id": user_id,
+        "date_from": date_from,
+        "date_to": date_to
+    }
+
+    filter_sql, params = _build_filters_funnel(base_params, brands, categories, sa_names)
+
+    query = f"""
+        SELECT 
+            nm_id,
+            COALESCE(SUM(ad_expense), 0) AS ad_expense,
+            MAX(product_image_url) AS product_image_url,
+            MAX(sa_name) AS sa_name,
+            MAX(category) AS category,
+            MAX(brand_name) AS brand_name
+        FROM v_advert_dashboard
+        WHERE user_id = %(user_id)s
+          AND date_stat >= %(date_from)s::date
+          AND date_stat <= %(date_to)s::date
+          {filter_sql}
+        GROUP BY nm_id
+        ORDER BY nm_id ASC
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(query, params)
+        result = cursor.fetchall()
+        return [dict(row) for row in result] if result else []
 
 
 # ═══════════════════════════════════════════════════════════════
