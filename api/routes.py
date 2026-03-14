@@ -36,7 +36,8 @@ from database import (
     get_dynamic_for_period_from_funnel,
     get_detail_for_period_from_report,
     get_detail_for_period_from_advert_stats,
-    get_detail_for_period_from_funnel
+    get_detail_for_period_from_funnel,
+    get_filters_for_user
 )
 from utils import logger
 
@@ -884,7 +885,27 @@ class UserLoadInfoResponse(BaseModel):
     total_users: int
     total_records: int
 
+class FilterResponse(BaseModel):
+    """Ответ с уникальными значениями для фильтров"""
+    sa_name: Optional[List[str]] = None
+    brends: Optional[List[str]] = None
+    category: Optional[List[str]] = None
 
+@router.get("/dashboard/getfilter", response_model=FilterResponse)
+async def get_filters(user_id: int = Query(..., description="ID пользователя")):
+    """
+    GET /api/dashboard/getfilter?user_id=3
+    Возвращает уникальные значения для фильтров дашборда
+    """
+    try:
+        if not user_id:
+            raise ValueError(f"Пользователь не передан в get")
+        result = get_filters_for_user(user_id)
+        return result
+
+    except Exception as e:
+        logger.error(f"API error /api/dashboard/getfilter: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 @router.get(
     "/user_load_info",
     response_model=UserLoadInfoResponse,

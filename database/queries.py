@@ -1488,3 +1488,40 @@ def insert_cost_price(user_id: int,nm_id: int, cost_price: float, fulfillment:fl
         except Exception as e:
             logger.error(f"User {user_id}: ошибка вставки данных: {e}")
             raise
+
+
+def get_filters_for_user(user_id: int) -> Dict[str, Any]:
+    """
+    Получает уникальные значения для фильтров дашборда.
+
+    Возвращает:
+        - sa_name: уникальные артикулы поставщика
+        - brends: уникальные бренды
+        - category: уникальные категории (subject_name)
+    """
+    query = """
+            SELECT array_agg(DISTINCT sa_name) FILTER (WHERE sa_name IS NOT NULL AND sa_name != '')                AS sa_name, \
+                   array_agg(DISTINCT brand_name) \
+                   FILTER (WHERE brand_name IS NOT NULL AND brand_name != '')                                      AS brends, \
+                   array_agg(DISTINCT subject_name) \
+                   FILTER (WHERE subject_name IS NOT NULL AND subject_name != '')                                  AS category
+            FROM financial_reports
+            WHERE user_id = %s \
+            """
+
+    with get_cursor() as cursor:
+        cursor.execute(query, (user_id,))
+        result = cursor.fetchone()
+
+        if result:
+            return {
+                "sa_name": result["sa_name"],
+                "brends": result["brends"],
+                "category": result["category"],
+            }
+
+        return {
+            "sa_name": None,
+            "brends": None,
+            "category": None,
+        }

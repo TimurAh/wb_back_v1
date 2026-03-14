@@ -25,15 +25,18 @@ from .queries import (
     get_cost_price,
     insert_cost_price,
     update_photos_in_cost_price,
-    #динамика
+    # динамика
     get_dynamic_for_period_from_report,
     get_dynamic_for_period_from_advert_stats,
-get_dynamic_for_period_from_funnel,
+    get_dynamic_for_period_from_funnel,
 
-#детализация
-get_detail_for_period_from_report,
-get_detail_for_period_from_advert_stats,
-get_detail_for_period_from_funnel,
+    # детализация
+    get_detail_for_period_from_report,
+    get_detail_for_period_from_advert_stats,
+    get_detail_for_period_from_funnel,
+
+    # фильтр
+    get_filters_for_user,
 
 )
 
@@ -72,8 +75,10 @@ __all__ = [
     "get_dynamic_for_period_from_report",
     "get_dynamic_for_period_from_advert_stats",
     "get_dynamic_for_period_from_funnel",
-    #детализация
+    # детализация
     "get_detail_for_period_from_report",
     "get_detail_for_period_from_advert_stats",
     "get_detail_for_period_from_funnel",
+    # фильтр
+    "get_filters_for_user",
 ]
