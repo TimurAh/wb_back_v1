@@ -181,6 +181,41 @@ CREATE INDEX IF NOT EXISTS idx_financial_reports_nm_id ON financial_reports (nm_
 CREATE INDEX IF NOT EXISTS idx_financial_reports_sale_dt ON financial_reports (sale_dt);
 """
 
+CREATE_VIEWS = """
+-- View для дашборда (financial_reports + cost_price)
+CREATE OR REPLACE VIEW v_report_dashboard AS
+SELECT
+    fr.rrd_id,
+    fr.user_id,
+    fr.nm_id,
+    fr.date_to,
+    fr.doc_type_name,
+    fr.supplier_oper_name,
+    fr.bonus_type_name,
+    fr.retail_price,
+    fr.retail_amount,
+    fr.quantity,
+    fr.return_amount,
+    fr.ppvz_for_pay,
+    fr.commission_percent,
+    fr.delivery_rub,
+    fr.penalty,
+    fr.storage_fee,
+    fr.acceptance,
+    fr.deduction,
+    fr.sa_name,
+    fr.brand_name,
+    fr.subject_name,
+    COALESCE(cp.c_price, 0)     AS c_price,
+    COALESCE(cp.fulfillment, 0) AS fulfillment,
+    cp.url_photo                AS product_image_url,
+    cp.sa_name                  AS cp_sa_name
+FROM financial_reports fr
+LEFT JOIN cost_price cp
+    ON cp.nm_id = fr.nm_id
+   AND cp.user_id = fr.user_id;
+"""
+
 # Список всех SQL запросов для выполнения по порядку
 SQL_STATEMENTS = [
     ("user", CREATE_USER_TABLE),
@@ -188,6 +223,7 @@ SQL_STATEMENTS = [
     ("funnel_product", CREATE_FUNNEL_TABLE),
     ("advert_fullstats", CREATE_ADVERT_TABLE),
     ("cost_price", CREATE_COST_PRICE_TABLE),
+    ("views", CREATE_VIEWS),
     ("indexes", CREATE_INDEXES),
 ]
 
